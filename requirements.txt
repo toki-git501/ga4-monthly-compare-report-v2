@@ -1,0 +1,8 @@
+streamlit
+streamlit-pdf-viewer
+pandas
+numpy
+matplotlib
+reportlab
+pillow
+setuptools
