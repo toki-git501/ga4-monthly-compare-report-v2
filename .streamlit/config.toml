@@ -1,0 +1,12 @@
+[server]
+headless = true
+maxUploadSize = 200
+
+[client]
+toolbarMode = "minimal"
+
+[theme]
+primaryColor = "#1A6FAB"
+backgroundColor = "#F5F8FC"
+secondaryBackgroundColor = "#EEF3F8"
+textColor = "#1E2B3A"
