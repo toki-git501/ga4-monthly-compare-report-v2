@@ -7,7 +7,7 @@ from datetime import datetime
 from report_logic_compare import generate_compare_report
 from csv_parser import parse_ga4_csv
 
-APP_VERSION = "2026-07-09-v2"
+APP_VERSION = "2026-07-10-v3"
 
 # ─────────────────────────────────────────────────────
 # アイコン画像パス
@@ -62,6 +62,42 @@ def validate_csvs(cur_bytes, prev_bytes):
         errors.append(f"当月の終了日({cur_end})が比較月の終了日({prev_end})以前です。アップロード先を確認してください。")
 
     return errors
+
+
+def data_advisories(cur_bytes, prev_bytes, single_mode):
+    """生成前に注意喚起すべきデータ品質上のアドバイスを返す（エラーではない）。"""
+    advisories = []
+    try:
+        cur_data = parse_ga4_csv(cur_bytes)
+        prev_data = parse_ga4_csv(prev_bytes) if not single_mode else None
+    except Exception:
+        return advisories
+
+    def month_label(d):
+        return d['meta'].get('month_label', '') if d else ''
+
+    # 計測期間の不完全さ
+    for d, tag in [(cur_data, '当月'), (None if single_mode else prev_data, '比較月')]:
+        if not d:
+            continue
+        m = d['meta'].get('measure', {})
+        if m.get('incomplete'):
+            untracked = max(0, int(m.get('measured_from_day', 1)) - 1)
+            advisories.append(
+                f"{tag}（{month_label(d)}）は月初〜{untracked}日目が未計測の可能性があります"
+                f"（{m.get('measured_from_day', 1)}日目以降のみ計測）。前月比は参考値として扱われます。"
+            )
+
+    # 海外アクセスの混入
+    c = cur_data['meta'].get('country', {})
+    if c.get('available') and c.get('overseas_present'):
+        share = c.get('jp_share')
+        share_txt = f"（国内JP約{share * 100:.0f}%）" if share is not None else ""
+        advisories.append(
+            f"当月データに海外・ボット等のアクセスが含まれています{share_txt}。"
+            "国内のみで集計する場合はGA4側で国フィルタを適用し再エクスポートしてください。"
+        )
+    return advisories
 
 # ─────────────────────────────────────────────────────
 # Streamlit UI 設定
@@ -218,6 +254,10 @@ with col2:
                 if validation_errors:
                     for err in validation_errors:
                         st.warning(err)
+
+            # データ品質アドバイス（不完全な計測期間・海外アクセス混入）
+            for adv in data_advisories(cur_bytes, prev_bytes, single_mode):
+                st.warning(f"⚠ {adv}")
 
             spinner_text = "単月分析レポートを生成中です。しばらくお待ちください..." if single_mode else "比較レポートを生成中です。しばらくお待ちください..."
             with st.spinner(spinner_text):

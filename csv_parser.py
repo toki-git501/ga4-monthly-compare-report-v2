@@ -172,6 +172,74 @@ def parse_ga4_csv(filepath_or_bytes) -> dict:
     if df_kev is None:
         df_kev_platform = read_section(r'プラットフォーム,キーイベント$')
     df_trend  = read_section(r'N 日目,30 日,7 日,1 日')
+    # 国別アクティブユーザー（国 ID 優先、無ければ 国）
+    df_country = read_section(r'国 ID,アクティブ ユーザー$')
+    if df_country is None:
+        df_country = read_section(r'^国,アクティブ ユーザー$')
+
+    # ─ 国別サマリ（海外アクセスの有無を正確に把握するため） ─
+    # 注意: KPI(セッション/ユーザー)はチャネル別・日別集計から算出されるため、
+    # このCSVからは国別での再集計はできない。ここでは「海外が含まれているか」
+    # 「JP比率がどの程度か」を注記に使うためだけに国別内訳を読み取る。
+    country_info = {
+        'available': False,
+        'total': 0,
+        'jp': 0,
+        'overseas': 0,
+        'jp_share': None,
+        'overseas_present': False,
+    }
+    if df_country is not None and not df_country.empty:
+        code_col = df_country.columns[0]
+        val_col = df_country.columns[1]
+        codes = df_country[code_col].astype(str).str.strip()
+        vals = _to_numeric_series(df_country[val_col]).fillna(0)
+        total = int(vals.sum())
+        jp_mask = codes.str.upper().isin(['JP', 'JAPAN', '日本'])
+        jp = int(vals[jp_mask].sum())
+        overseas = max(0, total - jp)
+        country_info = {
+            'available': True,
+            'total': total,
+            'jp': jp,
+            'overseas': overseas,
+            'jp_share': (jp / total) if total > 0 else None,
+            'overseas_present': overseas > 0,
+        }
+    meta['country'] = country_info
+
+    # ─ 計測期間の完全性チェック（前月比を「参考値」とすべきか判定） ─
+    # 日別アクティブユーザーの先頭が連続ゼロの場合、月の途中から計測開始した
+    # 可能性が高く、月初〜その日までが未計測。前月比の分母が不完全になる。
+    measure_info = {
+        'incomplete': False,
+        'leading_zero_days': 0,
+        'measured_from_day': 1,
+        'total_days': 0,
+        'measured_days': 0,
+    }
+    if df_active is not None and not df_active.empty:
+        active_vals = _to_numeric_series(df_active.iloc[:, 1]).fillna(0)
+        total_days = int(len(active_vals))
+        leading_zeros = 0
+        for v in active_vals:
+            if v <= 0:
+                leading_zeros += 1
+            else:
+                break
+        measured_days = int((active_vals > 0).sum())
+        # 先頭ゼロが5日以上、または計測日が全体の半分未満なら不完全とみなす
+        incomplete = (leading_zeros >= 5) or (
+            total_days > 0 and measured_days < total_days * 0.5
+        )
+        measure_info = {
+            'incomplete': bool(incomplete),
+            'leading_zero_days': leading_zeros,
+            'measured_from_day': leading_zeros + 1 if leading_zeros > 0 else 1,
+            'total_days': total_days,
+            'measured_days': measured_days,
+        }
+    meta['measure'] = measure_info
 
     # ─ KPI集計 ─
     kpis = {}
@@ -270,4 +338,5 @@ def parse_ga4_csv(filepath_or_bytes) -> dict:
         'df_events': df_events,
         'df_kev':    df_kev,
         'df_trend':  df_trend,
+        'df_country': df_country,
     }

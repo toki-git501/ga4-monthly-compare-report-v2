@@ -332,7 +332,7 @@ def make_cohort_chart(cur_trend, prev_trend, cur_label: str, prev_label: str,
         if idx == 0:
             ax.legend(fontsize=7, framealpha=0)
 
-    fig.suptitle('コホート分析（当月 vs 前月）', fontsize=11, color='#1E2B3A', y=1.04)
+    fig.suptitle('アクティブユーザー期間別比較（当月 vs 前月）', fontsize=11, color='#1E2B3A', y=1.04)
     # 3グラフ間の間隔を広めに確保
     fig.subplots_adjust(left=0.05, right=0.98, top=0.82, bottom=0.18, wspace=0.58)
     return fig_to_bytes(fig)

@@ -83,6 +83,49 @@ COLOR_PREV_DATA = colors.HexColor('#B0D4F1')
 PAGE_W, PAGE_H = A4[1], A4[0]  # landscape A4
 
 
+# ─────────────────────────────────────────────────────
+# データ連動の注記テキスト生成
+# ─────────────────────────────────────────────────────
+def country_note_text(meta: dict) -> str:
+    """国別データに基づく正確な対象範囲の注記を返す。
+
+    このCSVからはKPIの国別再集計ができないため、
+    「海外が含まれているか」を事実として明示する（虚偽の『海外除外済み』は使わない）。
+    """
+    c = (meta or {}).get('country') or {}
+    if not c.get('available'):
+        return ('※ 国別データが取得できませんでした。GA4側で国フィルタを適用していない場合、'
+                '海外・ボット等のアクセスが少量含まれることがあります。')
+    share = c.get('jp_share')
+    if c.get('overseas_present'):
+        share_txt = f'（当月アクティブのうち国内JPは約{share * 100:.0f}%）' if share is not None else ''
+    if not c.get('overseas_present'):
+        return '※ 本レポートの対象期間は、国内（日本／JP）からのアクセスが100%でした。'
+    return ('※ 本レポートは国フィルタ未適用のため、海外・ボット等のアクセスが少量含まれます'
+            f'{share_txt}。国内のみで集計する場合はGA4側で国フィルタを適用し再エクスポートしてください。')
+
+
+def incomplete_note_text(cur_meta: dict, prev_meta: dict,
+                         cur_label: str, prev_label: str,
+                         single_mode: bool = False) -> str:
+    """計測期間が不完全な月がある場合、前月比を参考値とする注記を返す（無ければ空文字）。"""
+    notes = []
+    prev_m = (prev_meta or {}).get('measure') or {}
+    cur_m = (cur_meta or {}).get('measure') or {}
+    if (not single_mode) and prev_m.get('incomplete'):
+        untracked = max(0, int(prev_m.get('measured_from_day', 1)) - 1)
+        notes.append(
+            f'前月（{prev_label}）は月初〜{untracked}日目が未計測（{prev_m.get("measured_from_day", 1)}日目以降のみ計測）'
+            'のため、前月比の増減率は参考値です。'
+        )
+    if cur_m.get('incomplete'):
+        untracked = max(0, int(cur_m.get('measured_from_day', 1)) - 1)
+        notes.append(
+            f'当月（{cur_label}）は月初〜{untracked}日目が未計測の可能性があり、数値が過小になる場合があります。'
+        )
+    return '　'.join(notes)
+
+
 class CompareReportCanvas:
     """月次比較レポート用キャンバス（7ページ構成）"""
 
@@ -231,7 +274,8 @@ class CompareReportCanvas:
 
     def draw_cover(self, cur_meta: dict, prev_meta: dict,
                    company_name: str = '', department: str = '', logo_path: str = None,
-                   single_mode: bool = False, site_url: str = ''):
+                   single_mode: bool = False, site_url: str = '',
+                   country_note: str = '', incomplete_note: str = ''):
         """P1: 表紙（比較期間表示）"""
         self._bg(COLOR_BG)
 
@@ -274,15 +318,26 @@ class CompareReportCanvas:
             self._text(bottom_x, PAGE_H * 0.2,
                        department, font_size=15, color=COLOR_DARK, align='right')
 
-        # 注釈
-        self._text(27 * mm, PAGE_H * 0.12,
-                   '※ 本レポートのデータは日本国内からのアクセスのみを対象としています。',
-                   font_size=8, color=COLOR_GRAY)
+        # 計測期間が不完全な場合の警告バンド（表紙で最初に目に入る位置）
+        if incomplete_note:
+            band_h = 12 * mm
+            band_y = PAGE_H * 0.2 - 4 * mm
+            self.c.setFillColor(colors.HexColor('#FFF7E8'))
+            self.c.setStrokeColor(colors.HexColor('#F0C36D'))
+            self.c.roundRect(27 * mm, band_y - band_h, 200 * mm, band_h, 3, fill=1, stroke=1)
+            self._text(30 * mm, band_y - band_h / 2 - 1 * mm,
+                       f'⚠ {incomplete_note}',
+                       font_size=7.5, color=colors.HexColor('#7A5A1F'))
+
+        # 注釈（国別データに基づく正確な対象範囲）
+        note = country_note or '※ 本レポートのデータはGA4からエクスポートされたCSVに基づいています。'
+        self._text(27 * mm, PAGE_H * 0.12, note, font_size=8, color=COLOR_GRAY)
 
         self._footer(company_name, 1)
 
     def draw_summary_compare(self, cur_meta, prev_meta, cur_kpis, prev_kpis,
-                             compared_kpis, daily_chart_bytes, company_name=''):
+                             compared_kpis, daily_chart_bytes, company_name='',
+                             incomplete_note=''):
         """P2: KPI比較サマリ（元の単月版レイアウト準拠）"""
         self._bg(COLOR_LIGHT)
 
@@ -354,9 +409,17 @@ class CompareReportCanvas:
                    f"（前月{prev_kpis['key_events_total']:,}  {kev_delta}）",
                    font_size=12, color=COLOR_WHITE, align='center')
 
+        # 計測期間が不完全な場合の注記（前月比は参考値）
+        chart_offset = 0
+        if incomplete_note:
+            note_y = banner_y - 13 * mm
+            self._text(12 * mm, note_y, f'⚠ {incomplete_note}',
+                       font_size=7, color=colors.HexColor('#B5791F'))
+            chart_offset = 5 * mm
+
         # 日別ユーザー推移グラフ（バナーの下、フッターの上に画面いっぱい）
         if daily_chart_bytes:
-            chart_top = banner_y - 14 * mm
+            chart_top = banner_y - 14 * mm - chart_offset
             chart_w = PAGE_W - 16 * mm  # 左右8mmマージン
             chart_h = chart_top - 14 * mm  # フッター上端まで
             self._image_bytes(daily_chart_bytes, 8 * mm, chart_top, chart_w, h=chart_h)
@@ -609,9 +672,9 @@ class CompareReportCanvas:
         self._footer(company_name, 5)
 
     def draw_page_engagement_page(self, cur_pages, prev_pages, cur_kpis, prev_kpis, company_name=''):
-        """P6: 上位ページ別エンゲージ時間（推定）"""
+        """P6: 上位ページ別 推定接触量（PV按分）"""
         self._bg(COLOR_LIGHT)
-        self._page_title_bar('上位ページ エンゲージ時間分析（推定）')
+        self._page_title_bar('上位ページ 推定接触量（PV按分・実測滞在時間ではありません）')
 
         margin = 12 * mm
         content_top = PAGE_H - 30 * mm
@@ -639,7 +702,7 @@ class CompareReportCanvas:
         # 1PVあたり平均滞在時間（目安）をタイトル横に表示
         table_y = content_top
         avg_label = f'1PVあたり平均滞在時間（目安）: 当月 {fmt_sec(cur_eng_per_pv)} / 前月 {fmt_sec(prev_eng_per_pv)}'
-        self._section_header(margin, table_y, '上位20ページ別 推定エンゲージ時間（当月 vs 前月）', avg_label)
+        self._section_header(margin, table_y, '上位20ページ別 推定接触量（PV按分・当月 vs 前月）', avg_label)
 
         headers = ['#', 'ページ', '当月', '前月', '増減']
         rows = []
@@ -770,7 +833,8 @@ class CompareReportCanvas:
 
     def draw_summary_page(self, highlights: dict, cur_meta: dict, prev_meta: dict,
                           company_name='', page_num=7, single_mode: bool = False,
-                          cur_kpis: dict | None = None):
+                          cur_kpis: dict | None = None,
+                          country_note: str = '', incomplete_note: str = ''):
         """P7: 総括"""
         self._bg(COLOR_LIGHT)
         self._page_title_bar('月次比較 総括')
@@ -820,19 +884,24 @@ class CompareReportCanvas:
                    highlights['best_kpi']['delta'], font_size=9,
                    color=COLOR_INCREASE)
 
-        # 最も注意が必要な指標
+        # 2枚目カード: worst が実際に減少なら「注意が必要な指標」、
+        # 全KPI増加など worst も増加している場合は「伸びが最も小さい指標」として中立表示
+        worst_is_decline = bool(highlights.get('worst_kpi', {}).get('is_decline'))
         cx2 = margin + card_w + 12 * mm
+        card2_title = '注意が必要な指標' if worst_is_decline else '伸びが最も小さい指標'
+        card2_bar = COLOR_DECREASE if worst_is_decline else COLOR_GRAY
+        card2_delta_color = COLOR_DECREASE if worst_is_decline else COLOR_GRAY
         self._rect(cx2, card_y - card_h, card_w, card_h,
                    fill_color=COLOR_CARD_BG, stroke_color=colors.HexColor('#DDE6EF'))
         self._rect(cx2, card_y - 3 * mm, card_w, 3 * mm,
-                   fill_color=COLOR_DECREASE, radius=0)
+                   fill_color=card2_bar, radius=0)
         self._text(cx2 + 5 * mm, card_y - 10 * mm,
-                   '注意が必要な指標', font_size=9, color=COLOR_GRAY)
+                   card2_title, font_size=9, color=COLOR_GRAY)
         self._text(cx2 + 5 * mm, card_y - 17 * mm,
                    highlights['worst_kpi']['label'], font_size=13, color=COLOR_DARK)
         self._text(cx2 + 5 * mm, card_y - 23 * mm,
                    highlights['worst_kpi']['delta'], font_size=9,
-                   color=COLOR_DECREASE)
+                   color=card2_delta_color)
 
         # 優先施策ハイライト
         hl_y = card_y - card_h - 10 * mm
@@ -915,23 +984,27 @@ class CompareReportCanvas:
         else:
             right_bottom = ay - 5 * mm - min(len(action_items), 2) * 5 * mm
         note_y = min(left_bottom, right_bottom) - 10 * mm
+        if incomplete_note:
+            self._text(margin, note_y, f'⚠ {incomplete_note}',
+                       font_size=7, color=colors.HexColor('#B5791F'))
+            note_y -= 4.5 * mm
         self._text(margin, note_y,
-                   '※ 日本国内からのアクセスのみを対象。海外からのアクセスは除外済み。',
+                   country_note or '※ 本レポートはGA4エクスポートCSVに基づいています。',
                    font_size=7, color=COLOR_GRAY)
 
         self._footer(company_name, page_num)
 
     def draw_cohort_compare(self, cohort_chart_bytes, cur_trend, prev_trend,
                             cur_label, prev_label, company_name='',
-                            page_num=8):
-        """P8: コホート分析"""
+                            page_num=8, incomplete_note=''):
+        """P8: アクティブユーザー期間別比較（30日/7日/1日）"""
         self._bg(COLOR_LIGHT)
-        self._page_title_bar('コホート分析')
+        self._page_title_bar('アクティブユーザー期間別比較（30日 / 7日 / 1日）')
 
         content_top = PAGE_H - 30 * mm
         margin = 10 * mm
 
-        # コホートチャート（30日/7日/1日）
+        # 期間別アクティブユーザー推移（30日/7日/1日）
         self._section_header(margin, content_top, 'アクティブユーザー推移', '30日 / 7日 / 1日')
         if cohort_chart_bytes:
             self._image_bytes(cohort_chart_bytes, margin, content_top - 5 * mm,
@@ -941,6 +1014,12 @@ class CompareReportCanvas:
             if df is not None and col_idx < len(df.columns):
                 return int(df.iloc[:, col_idx].iloc[-1])
             return 0
+
+        # 計測不完全月の注意（前月の30日=7日が同値になる等、定着率が解釈困難になる）
+        if incomplete_note:
+            self._text(margin, content_top - 52 * mm,
+                       f'⚠ {incomplete_note} 計測期間が短い月は定着率が正しく算出されない場合があります。',
+                       font_size=6.8, color=colors.HexColor('#B5791F'))
 
         # リテンション率 — ファネル形式
         ret_y = content_top - 60 * mm
@@ -1038,7 +1117,7 @@ class CompareReportCanvas:
 
         # --- 指標の解説表 ---
         explain_y = fy - box_h - 10 * mm
-        self._section_header(margin, explain_y, 'コホート指標の見方')
+        self._section_header(margin, explain_y, '期間別アクティブユーザー指標の見方')
 
         cohort_terms = [
             ('30日アクティブ', '直近30日間に1回以上訪問したユーザー数（≒月間アクティブユーザー / MAU）'),
@@ -1312,6 +1391,16 @@ class CompareReportCanvas:
 
         # 注意書き
         note_y = table_top - 5 * mm - (len(rows) + 1) * 7 * mm - 3 * mm
+        cv_uncounted = (cur_total_cv == 0 and prev_total_cv == 0)
+        if cv_uncounted:
+            self._text(
+                margin, note_y,
+                '⚠ 実測CV（キーイベント）が未計測のため、広告経由の推定CV・推定CVRは算出できず0と表示されています。'
+                '広告費対効果の判定には、GA4でのキーイベント設定とGoogle広告連携が必須です。',
+                font_size=6.5,
+                color=colors.HexColor('#B5791F'),
+            )
+            note_y -= 4.5 * mm
         self._text(
             margin, note_y,
             '* 推定値: GA4のCSVにはチャネル別CV数が含まれないため、広告セッション比率×全体CV数で按分した推定値です。実際の広告経由CV数とは異なる場合があります。',
@@ -1321,7 +1410,7 @@ class CompareReportCanvas:
 
         self._footer(company_name, page_num)
 
-    def draw_glossary(self, company_name='', page_num=10):
+    def draw_glossary(self, company_name='', page_num=10, country_note='', incomplete_note=''):
         """P8: 用語解説"""
         self._bg(COLOR_LIGHT)
         self._page_title_bar('用語解説・注記')
@@ -1351,7 +1440,7 @@ class CompareReportCanvas:
             ('リテンション率',
              '上位期間のユーザーが下位期間でも訪問している割合。高いほどユーザーの定着度が良好であることを示す。'),
             ('30日/7日/1日アクティブ',
-             '直近30日(MAU)/7日(WAU)/1日(DAU)に訪問したユーザー数。コホート分析で定着度を測る基本指標。'),
+             '直近30日(MAU)/7日(WAU)/1日(DAU)に訪問したユーザー数。期間別のアクティブユーザー比較で定着度を測る基本指標。'),
         ]
 
         self._section_header(margin, content_top, '用語解説')
@@ -1375,11 +1464,17 @@ class CompareReportCanvas:
         note_top = content_top - 14 * mm - len(terms) * row_h - 4 * mm
         self._section_header(margin, note_top, '注記')
 
+        # 国別データに基づく正確な対象範囲の注記（虚偽の「海外除外済み」は使わない）
+        country_line = (country_note or
+                        '※ 本レポートはGA4エクスポートCSVに基づいています。').lstrip('※ ').strip()
         notes = [
             '• 本レポートのデータはGA4（Google Analytics 4）からエクスポートされたCSVに基づいています。',
-            '• 日本国内からのアクセスのみを対象としています。海外からのアクセス（ボット・スパム等含む）は除外されています。',
+            '• ' + country_line,
             '• ユーザー数はCookieベースの推定値であり、実際のユニークユーザー数とは異なる場合があります。',
+            '• 「推定接触量」はページ別の実測滞在時間ではなく、全体のエンゲージ時間をPV比で按分した推定値です。',
         ]
+        if incomplete_note:
+            notes.append('• ' + incomplete_note.lstrip('※ ').strip())
 
         for i, note in enumerate(notes):
             ny = note_top - 9 * mm - i * 5.2 * mm
@@ -1474,16 +1569,24 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
     # 4. ハイライト計算
     highlights = compute_highlights(compared_kpis, compared_channels, compared_kevents)
 
+    # 4.5 データ連動の注記（国別の対象範囲・計測期間の完全性）
+    country_note = country_note_text(cur_meta)
+    incomplete_note = incomplete_note_text(cur_meta, prev_meta, cur_label, prev_label,
+                                           single_mode=single_mode)
+
     # 5. PDF生成
     rc = CompareReportCanvas(output_path)
 
     # P1: 表紙
-    rc.draw_cover(cur_meta, prev_meta, company_name, department, logo_path, single_mode=single_mode, site_url=site_url)
+    rc.draw_cover(cur_meta, prev_meta, company_name, department, logo_path,
+                  single_mode=single_mode, site_url=site_url,
+                  country_note=country_note, incomplete_note=incomplete_note)
     rc.new_page()
 
     # P2: KPI比較サマリ
     rc.draw_summary_compare(cur_meta, prev_meta, cur_kpis, prev_kpis,
-                            compared_kpis, daily_chart, company_name)
+                            compared_kpis, daily_chart, company_name,
+                            incomplete_note=incomplete_note)
     rc.new_page()
 
     # P3: チャネル比較
@@ -1523,9 +1626,10 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
                                       cur_kpis, prev_kpis, compared_kpis, company_name, page_num=7)
         rc.new_page()
 
-        # P8: コホート分析
+        # P8: アクティブユーザー期間別比較
         rc.draw_cohort_compare(cohort_chart, cur_data['df_trend'], prev_data['df_trend'],
-                               cur_label, prev_label, company_name, page_num=8)
+                               cur_label, prev_label, company_name, page_num=8,
+                               incomplete_note=incomplete_note)
         rc.new_page()
 
         # P9: 広告分析
@@ -1551,11 +1655,14 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
             page_num=10,
             single_mode=single_mode,
             cur_kpis=cur_kpis,
+            country_note=country_note,
+            incomplete_note=incomplete_note,
         )
         rc.new_page()
 
         # P11: 用語解説・注記
-        rc.draw_glossary(company_name=company_name, page_num=11)
+        rc.draw_glossary(company_name=company_name, page_num=11,
+                         country_note=country_note, incomplete_note=incomplete_note)
     else:
         # P6: 上位ページ エンゲージ時間分析
         rc.draw_page_engagement_page(
@@ -1581,11 +1688,14 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
             page_num=8,
             single_mode=single_mode,
             cur_kpis=cur_kpis,
+            country_note=country_note,
+            incomplete_note=incomplete_note,
         )
         rc.new_page()
 
         # P9: 用語解説・注記（標準版）
-        rc.draw_glossary(company_name=company_name, page_num=9)
+        rc.draw_glossary(company_name=company_name, page_num=9,
+                         country_note=country_note, incomplete_note=incomplete_note)
 
     rc.save()
     return output_path

@@ -175,6 +175,10 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
         if worst is None or pct < worst[1]:
             worst = (label, pct, d)
 
+    # worst が実際には「増加」の場合、「注意が必要」ではなく「伸びが最も小さい指標」
+    # として扱う（全KPIが増加している月に、増加した指標を注意指標と誤表示しないため）
+    worst_is_decline = bool(worst and worst[2].get('diff', 0) < 0)
+
     highlights = {
         'best_kpi': {
             'label': best[0] if best else '-',
@@ -183,6 +187,7 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
         'worst_kpi': {
             'label': worst[0] if worst else '-',
             'delta': format_delta(worst[2]) if worst else '-',
+            'is_decline': worst_is_decline,
         },
     }
 
@@ -227,6 +232,11 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
     kev = compared_kpis.get('key_events_total', {})
     eng = compared_kpis.get('avg_engage_sec', {})
     new_u = compared_kpis.get('new_users', {})
+
+    # CV（キーイベント）が当月・前月とも0 = 実質「未計測」。
+    # この場合、アクセス増減を成果（予約・電話）の良し悪しとして語れないため、
+    # 文言・施策の出し方を切り替える。
+    cv_uncounted = (int(kev.get('current', 0)) == 0 and int(kev.get('previous', 0)) == 0)
 
     if ses.get('pct') is not None:
         if ses.get('diff', 0) > 0:
@@ -280,6 +290,14 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
                 f"1ユーザーあたりの利用時間は前月より {abs(eng.get('pct', 0)):.1f}% 短くなりました。離脱しやすい上位ページから先に改善対象として着手するのが効率的です。"
             )
 
+    # CV未計測時のカウント注意（アクセス増減を成果として誤読させないため）
+    if cv_uncounted:
+        headline_lines.append('成果（予約・電話等）は未計測のため、アクセスの増減は参考値です')
+        improve_points.append(
+            '予約・電話などの成果（キーイベント）が未計測のため、アクセス増が予約・新患獲得につながったかは判断できません。'
+            'GA4でのキーイベント設定が最優先課題です。'
+        )
+
     # --- 優先施策ハイライト（優先度スコア付き、上位2件を選定） ---
     # (priority, action_text) のリスト。priorityが大きいほど優先
     scored_actions = []
@@ -322,6 +340,23 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
             'アクセス・CV共に減少 → まず減少した流入チャネルを特定し、広告配信面と検索流入面を分けて原因を調査する。'))
         scored_actions.append((110 + ses_pct + kev_pct,
             '上位ページの離脱率が高い可能性。ファーストビューの見出しをユーザーの検索意図に合わせ、主要ボタンを1つに絞る。'))
+    elif cv_uncounted and (ses_up or ses_down):
+        # CVが未計測（0/0）でアクセスだけが増減しているケース。
+        # 旧実装ではこの分岐が無く「主要指標は横ばい」に誤って落ちていた。
+        scored_actions.append((115 + ses_pct,
+            'アクセスは大きく変動しているが、予約・電話などの成果（キーイベント）が未計測。'
+            'まずGA4で予約ボタン・電話タップ・問い合わせ導線をキーイベント設定し、成果を計測できる状態にする。'))
+        if ses_up:
+            scored_actions.append((70 + ses_pct,
+                'アクセス増を成果につなげるため、流入が増えた上位ページのファーストビューに'
+                '予約導線（ボタン・電話番号・初診の流れ）を明確に配置する。'))
+    elif ses_up:
+        # アクセス増（CVは増減判定できないが計測はある/フラット）
+        scored_actions.append((60 + ses_pct,
+            'アクセスは増加 → 伸びた流入元の訴求を維持しつつ、成果につながりやすい上位ページの予約導線を優先的に強化する。'))
+    elif ses_down:
+        scored_actions.append((100 + ses_pct,
+            'アクセスは減少 → 減少した流入チャネルを特定し、検索上位ページのタイトル・メタディスクリプションと広告配信を見直す。'))
     else:
         scored_actions.append((30,
             '主要指標は横ばい → 現状維持しつつ、上位ページで小規模なA/Bテスト（見出し変更・CTA色変更等）を実施して改善の余地を探る。'))
