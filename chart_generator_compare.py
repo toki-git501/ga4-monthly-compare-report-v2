@@ -178,19 +178,16 @@ def make_top_pages_compare_chart(cur_pages, prev_pages, top_n=20,
     if cur_pages is None:
         return None
 
-    col_p = cur_pages.columns[0]
-    col_v = cur_pages.columns[1]
+    # 選定基準は表側（report_logic_compare）と共通で max(当月PV, 前月PV)。
+    # 当月PV降順だと当月0PVのページがグラフからも消え、消失を検知できなかった。
+    from compare_utils import select_top_pages
+    selected = select_top_pages(cur_pages, prev_pages, top_n)
+    if selected.empty:
+        return None
 
-    cur_top = cur_pages.head(top_n).copy()
-    page_names = cur_top[col_p].tolist()
-
-    cur_vals = cur_top[col_v].tolist()
-    prev_vals = []
-    if prev_pages is not None:
-        prev_map = dict(zip(prev_pages[prev_pages.columns[0]], prev_pages[prev_pages.columns[1]]))
-        prev_vals = [prev_map.get(p, 0) for p in page_names]
-    else:
-        prev_vals = [0] * len(page_names)
+    page_names = selected['page'].tolist()
+    cur_vals = selected['cur'].tolist()
+    prev_vals = selected['prev'].tolist()
 
     # ラベル短縮
     def shorten(title, max_len=20):

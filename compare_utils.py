@@ -178,11 +178,17 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
     # worst が実際には「増加」の場合、「注意が必要」ではなく「伸びが最も小さい指標」
     # として扱う（全KPIが増加している月に、増加した指標を注意指標と誤表示しないため）
     worst_is_decline = bool(worst and worst[2].get('diff', 0) < 0)
+    # best が実際には「減少」の場合、「最も改善した指標」と呼ぶのは誤り。
+    # 全KPIが下落した月に、減少している指標を改善として緑色表示しないための判定。
+    best_is_gain = bool(best and best[2].get('diff', 0) > 0)
+    best_is_flat = bool(best and best[2].get('diff', 0) == 0)
 
     highlights = {
         'best_kpi': {
             'label': best[0] if best else '-',
             'delta': format_delta(best[2]) if best else '-',
+            'is_gain': best_is_gain,
+            'is_flat': best_is_flat,
         },
         'worst_kpi': {
             'label': worst[0] if worst else '-',
@@ -446,3 +452,63 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
     highlights['executive_comments'] = comments[:8]
 
     return highlights
+
+
+def select_top_pages(cur_pages, prev_pages, top_n: int = 20) -> pd.DataFrame:
+    """上位ページの選定。当月PVと前月PVの「大きい方」で順位付けする。
+
+    従来は当月PVの降順で上位N件を選んでいたため、当月0PVになったページ
+    （例: 前月218PV → 当月0PV）が表から構造的に消え、消失を検知できなかった。
+    max(当月, 前月) を基準にすると、当月伸びたページと前月まで主力だったページの
+    双方が対称に選ばれ、行数もN件のまま増えない。
+
+    戻り値: columns = ['page', 'cur', 'prev', 'diff', 'status']
+        status は 'new'（前月0→当月あり）/ 'lost'（前月あり→当月0）/ ''。
+    """
+    def _to_map(df):
+        if df is None or df.empty:
+            return {}
+        col_p, col_v = df.columns[0], df.columns[1]
+        out = {}
+        for _, r in df.iterrows():
+            key = str(r[col_p])
+            try:
+                val = int(r[col_v])
+            except (TypeError, ValueError):
+                continue
+            # 同名タイトルが複数行ある場合は合算（GA4はページタイトル単位のため起こり得る）
+            out[key] = out.get(key, 0) + val
+        return out
+
+    cur_map = _to_map(cur_pages)
+    prev_map = _to_map(prev_pages)
+    if not cur_map and not prev_map:
+        return pd.DataFrame(columns=['page', 'cur', 'prev', 'diff', 'status'])
+
+    rows = []
+    for page in set(cur_map) | set(prev_map):
+        cur_v = cur_map.get(page, 0)
+        prev_v = prev_map.get(page, 0)
+        if cur_v == 0 and prev_v == 0:
+            continue
+        status = ''
+        if prev_v == 0 and cur_v > 0:
+            status = 'new'
+        elif cur_v == 0 and prev_v > 0:
+            status = 'lost'
+        rows.append({
+            'page': page,
+            'cur': cur_v,
+            'prev': prev_v,
+            'diff': cur_v - prev_v,
+            'status': status,
+            '_rank_key': max(cur_v, prev_v),
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=['page', 'cur', 'prev', 'diff', 'status'])
+    # 同順位は当月PVの大きい方を上に（当月の実態を優先して読ませる）
+    df = df.sort_values(['_rank_key', 'cur'], ascending=[False, False])
+    df = df.head(top_n).drop(columns=['_rank_key']).reset_index(drop=True)
+    return df

@@ -1,0 +1,5 @@
+_verify/
+_verify_regen.py
+.venv/
+__pycache__/
+_commit_msg.txt
