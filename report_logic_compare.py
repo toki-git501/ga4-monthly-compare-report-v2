@@ -29,6 +29,11 @@ from reportlab.lib.utils import ImageReader
 from PIL import Image as PILImage
 
 from csv_parser import parse_ga4_csv
+
+# 出力PDFに刻む生成バージョン。
+# デプロイが反映されたかを、出力物そのもので判定できるようにするため。
+# ロジックを変更したら必ず更新すること。
+REPORT_VERSION = '2026-08-13-v4'
 from compare_utils import (
     calc_diff, format_delta, delta_color,
     compare_kpis, compare_dataframes, compare_key_events, compute_highlights,
@@ -1649,6 +1654,7 @@ class CompareReportCanvas:
             '• ' + country_line,
             '• ユーザー数はCookieベースの推定値であり、実際のユニークユーザー数とは異なる場合があります。',
             '• 「推定接触量」はページ別の実測滞在時間ではなく、全体のエンゲージ時間をPV比で按分した推定値です。',
+            f'• 本レポートの生成バージョン: v{REPORT_VERSION}',
         ]
         if incomplete_note:
             notes.append('• ' + incomplete_note.lstrip('※ ').strip())

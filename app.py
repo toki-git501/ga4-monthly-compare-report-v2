@@ -7,7 +7,8 @@ from datetime import datetime
 from report_logic_compare import generate_compare_report
 from csv_parser import parse_ga4_csv
 
-APP_VERSION = "2026-07-10-v3"
+# バージョンはPDF生成側と共有する（出力物からデプロイ状態を判定できるようにするため）
+from report_logic_compare import REPORT_VERSION as APP_VERSION
 
 # ─────────────────────────────────────────────────────
 # アイコン画像パス

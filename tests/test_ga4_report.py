@@ -260,6 +260,11 @@ class TestPdf:
     def test_国別比率の母数が明示される(self, pdf_text):
         assert any('/975人' in t or '/ 975人' in t for t in pdf_text)
 
+    def test_生成バージョンがPDFに刻まれる(self, pdf_text):
+        """出力物だけでデプロイ反映の有無を判定できるようにする。"""
+        from report_logic_compare import REPORT_VERSION
+        assert any(REPORT_VERSION in t for t in pdf_text)
+
 
 class TestPdfPaid:
     @pytest.fixture(scope='class')
