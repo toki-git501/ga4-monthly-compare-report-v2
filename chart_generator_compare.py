@@ -256,18 +256,28 @@ def make_engagement_overlay_chart(cur_engage, prev_engage, cur_label: str, prev_
     return fig_to_bytes(fig)
 
 
-def make_new_vs_returning_compare(cur_new, cur_active, prev_new, prev_active,
+def make_new_vs_returning_compare(cur_new_total, cur_active_total,
+                                  prev_new_total, prev_active_total,
                                   cur_label: str, prev_label: str,
                                   width_inch=6, height_inch=3.5) -> bytes:
-    """新規 vs リピーター比較（積み上げ棒グラフ）"""
-    def get_vals(df_new, df_active):
-        new_total = int(df_new.iloc[:, 1].sum()) if df_new is not None else 0
-        active_total = int(df_active.iloc[:, 1].sum()) if df_active is not None else 0
+    """新規 vs リピーター比較（積み上げ棒グラフ）。
+
+    引数はユーザー数の実数（KPIカードと同じ値）。
+
+    旧実装は日別アクティブユーザーの「合計」から日別新規の合計を引いていたが、
+    日別アクティブは同一ユーザーを日ごとに重複計上するため、これはリピーターの
+    人数ではなく「延べ訪問日数 − 新規人数」という意味のない値だった
+    （長久手2026年7月の例: 旧式289人 / 実際は約74〜99人）。
+    KPIカードと同じアクティブユーザー数・新規ユーザー数から算出する。
+    """
+    def get_vals(new_total, active_total):
+        new_total = int(new_total or 0)
+        active_total = int(active_total or 0)
         returning = max(active_total - new_total, 0)
         return new_total, returning
 
-    cur_new_v, cur_ret = get_vals(cur_new, cur_active)
-    prev_new_v, prev_ret = get_vals(prev_new, prev_active)
+    cur_new_v, cur_ret = get_vals(cur_new_total, cur_active_total)
+    prev_new_v, prev_ret = get_vals(prev_new_total, prev_active_total)
 
     fig, ax = plt.subplots(figsize=(width_inch, height_inch), facecolor='white')
     ax.set_facecolor('white')
@@ -294,7 +304,7 @@ def make_new_vs_returning_compare(cur_new, cur_active, prev_new, prev_active,
     ax.grid(True, axis='y', color=MPL_GRID, linewidth=0.8)
     _common_style(ax)
     ax.legend(fontsize=9, framealpha=0, loc='upper right')
-    ax.set_title('新規 vs リピーター比較', fontsize=11, pad=8, color='#1E2B3A')
+    ax.set_title('新規 vs リピーター（アクティブユーザー内訳）', fontsize=11, pad=8, color='#1E2B3A')
     fig.tight_layout()
     return fig_to_bytes(fig)
 

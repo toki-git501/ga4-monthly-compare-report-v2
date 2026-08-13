@@ -3,3 +3,4 @@ _verify_regen.py
 .venv/
 __pycache__/
 _commit_msg.txt
+_new_summary_block.py

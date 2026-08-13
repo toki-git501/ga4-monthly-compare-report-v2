@@ -911,7 +911,8 @@ class CompareReportCanvas:
                               col_w, h=65 * mm)
 
         # 右: 新規vsリピーター
-        self._section_header(col2_x, content_top, '新規 vs リピーター')
+        self._section_header(col2_x, content_top, '新規 vs リピーター',
+                             'リピーター = 30日アクティブ − 新規（集計窓が1日ずれるため概算）')
         if user_compare_chart_bytes:
             self._image_bytes(user_compare_chart_bytes, col2_x, content_top - 5 * mm,
                               col_w, h=65 * mm)
@@ -1043,25 +1044,31 @@ class CompareReportCanvas:
 
         # 優先施策ハイライト
         hl_y = card_y - card_h - 10 * mm
-        self._section_header(margin, hl_y, '優先施策ハイライト')
+        self._section_header(margin, hl_y, '次月の確認事項（根拠つき）')
 
         actions = highlights.get('action_items', [])
         if not actions:
-            actions = ['上位ページの見出しと導線を見直し、反応率の改善を優先。']
+            actions = ['主要指標に大きな変動はなし。次月も同じ指標で推移を確認する。']
 
-        action_row_h = 12 * mm
+        # 確認事項は根拠を併記するため長くなる。1行描画では右端で切れるので折り返す。
+        action_w = PAGE_W - 24 * mm - 22 * mm - 3 * mm
+        action_ys = []
+        iy = hl_y - 10 * mm
         for i, action in enumerate(actions[:2]):
-            iy = hl_y - 10 * mm - i * action_row_h
-            self._rect(margin, iy - 9 * mm, PAGE_W - 24 * mm, 10 * mm,
+            n_lines = max(len(self._wrap_lines(action, action_w, 7.5, max_lines=2)), 1)
+            box_h = 6 * mm + n_lines * 4.2 * mm
+            self._rect(margin, iy - box_h + 1 * mm, PAGE_W - 24 * mm, box_h,
                        fill_color=COLOR_CARD_BG, stroke_color=colors.HexColor('#DDE6EF'))
-            self._text(margin + 5 * mm, iy - 5 * mm, f'施策{i+1}',
+            self._text(margin + 5 * mm, iy - 5 * mm, f'確認{i+1}',
                        font_size=8, color=COLOR_GRAY)
-            self._text(margin + 22 * mm, iy - 5 * mm, action,
-                       font_size=7.5, color=COLOR_DARK)
+            self._text_wrapped(margin + 22 * mm, iy - 5 * mm, action,
+                               max_width=action_w,
+                               font_size=7.5, color=COLOR_DARK, max_lines=2)
+            action_ys.append(iy)
+            iy -= box_h + 2 * mm
 
         # KPI変動一覧（左）と総括コメント（右）
-        num_actions = min(len(actions), 2)
-        section_y = hl_y - 10 * mm - num_actions * action_row_h - 6 * mm
+        section_y = iy - 4 * mm
         col_gap = 0 * mm
         left_w = (PAGE_W - 24 * mm) * 0.45
         right_x = margin + left_w - 4 * mm
@@ -1098,19 +1105,19 @@ class CompareReportCanvas:
             improve_points = highlights.get('improve_points', [])
             action_items = highlights.get('action_items', [])
 
-            self._text(right_x + 2 * mm, ry, '良かった点', font_size=7.5, color=COLOR_PRIMARY)
+            self._text(right_x + 2 * mm, ry, '増加した指標', font_size=7.5, color=COLOR_PRIMARY)
             for i, txt in enumerate(good_points[:2]):
                 y = ry - 5 * mm - i * 5 * mm
                 self._text(right_x + 6 * mm, y, f'• {txt}', font_size=6.8, color=COLOR_DARK)
 
             iy = ry - 5 * mm - min(len(good_points), 2) * 5 * mm - 1.5 * mm
-            self._text(right_x + 2 * mm, iy, '改善ポイント', font_size=7.5, color=colors.HexColor('#C27116'))
+            self._text(right_x + 2 * mm, iy, '減少した指標', font_size=7.5, color=colors.HexColor('#C27116'))
             for i, txt in enumerate(improve_points[:2]):
                 y = iy - 5 * mm - i * 5 * mm
                 self._text(right_x + 6 * mm, y, f'• {txt}', font_size=6.8, color=COLOR_DARK)
 
             ay = iy - 5 * mm - min(len(improve_points), 2) * 5 * mm - 1.5 * mm
-            self._text(right_x + 2 * mm, ay, '次月アクション', font_size=7.5, color=colors.HexColor('#2E8B57'))
+            self._text(right_x + 2 * mm, ay, '次月の確認事項', font_size=7.5, color=colors.HexColor('#2E8B57'))
             # 施策文は長く、1行描画では右端で文が途切れていた（「…をキーイ」で切断）ため折り返す
             action_max_w = PAGE_W - (right_x + 6 * mm) - 10 * mm
             action_lines = 0
@@ -1470,19 +1477,16 @@ class CompareReportCanvas:
         cur_paid_total = cur_paid_ses['web'] + cur_paid_ses['sns']
         prev_paid_total = prev_paid_ses['web'] + prev_paid_ses['sns']
 
-        # 広告経由 推定CV（広告セッション比率 × 全体CV）
+        # 広告セッション比率（実測値。CVの推定には使わない）
+        #
+        # 旧実装は「推定広告CV = 全体CV × 広告セッション比率」で按分し、
+        # そこから「推定広告CVR = 推定広告CV ÷ 広告セッション」を算出していた。
+        # これは式を展開すると 推定広告CVR ≒ 全体CVR となり、
+        # 「広告のCVRは全体CVRと同じ」と仮定した値を「広告の成果」として
+        # 表示する循環推計だった。広告の良し悪しを一切表現しないため廃止し、
+        # 広告経由CV・CVRは「取得不能」と明示する。
         cur_ad_ratio = (cur_paid_total / cur_total_ses) if cur_total_ses > 0 else 0
         prev_ad_ratio = (prev_paid_total / prev_total_ses) if prev_total_ses > 0 else 0
-        cur_est_cv = round(cur_total_cv * cur_ad_ratio)
-        prev_est_cv = round(prev_total_cv * prev_ad_ratio)
-        cur_web_est_cv = round(cur_total_cv * (cur_paid_ses['web'] / cur_total_ses)) if cur_total_ses > 0 else 0
-        prev_web_est_cv = round(prev_total_cv * (prev_paid_ses['web'] / prev_total_ses)) if prev_total_ses > 0 else 0
-        cur_sns_est_cv = round(cur_total_cv * (cur_paid_ses['sns'] / cur_total_ses)) if cur_total_ses > 0 else 0
-        prev_sns_est_cv = round(prev_total_cv * (prev_paid_ses['sns'] / prev_total_ses)) if prev_total_ses > 0 else 0
-
-        # 広告セッションあたりCV率
-        cur_ad_cvr = (cur_est_cv / cur_paid_total * 100) if cur_paid_total > 0 else 0
-        prev_ad_cvr = (prev_est_cv / prev_paid_total * 100) if prev_paid_total > 0 else 0
 
         card_w = (PAGE_W - margin * 2 - 12 * mm) / 3
         card_h = 34 * mm
@@ -1497,10 +1501,11 @@ class CompareReportCanvas:
             'SNS広告 セッション', f'{cur_paid_ses["sns"]:,}', f'{prev_paid_ses["sns"]:,}',
             calc_diff(cur_paid_ses['sns'], prev_paid_ses['sns']), unit='sessions'
         )
+        # 推定CVカードは循環推計だったため、実測できる「広告セッション比率」に差し替え
         self._kpi_comparison_card(
             margin + (card_w + 6 * mm) * 2, y_cards, card_w, card_h,
-            '広告経由 推定CV', f'{cur_est_cv:,}', f'{prev_est_cv:,}',
-            calc_diff(cur_est_cv, prev_est_cv), unit='件'
+            '広告セッション比率', f'{cur_ad_ratio * 100:.1f}', f'{prev_ad_ratio * 100:.1f}',
+            calc_diff(round(cur_ad_ratio * 1000), round(prev_ad_ratio * 1000)), unit='%'
         )
 
         chart_top = content_top - 40 * mm
@@ -1510,7 +1515,8 @@ class CompareReportCanvas:
                               PAGE_W - 20 * mm, h=54 * mm)
 
         table_top = chart_top - 66 * mm
-        self._section_header(margin, table_top, '広告 比率サマリ / 広告経由 推定CV')
+        self._section_header(margin, table_top, '広告 比率サマリ',
+                             'CV・CVR・広告費はこのCSVでは算出不能')
         headers = ['指標', cur_label, prev_label, '差分']
         cur_web_ses_share = (cur_paid_ses['web'] / cur_total_ses * 100) if cur_total_ses > 0 else 0
         prev_web_ses_share = (prev_paid_ses['web'] / prev_total_ses * 100) if prev_total_ses > 0 else 0
@@ -1546,22 +1552,10 @@ class CompareReportCanvas:
                 f'{cur_sns_new_share - prev_sns_new_share:+.2f}pt',
             ],
             [
-                'Web広告 推定CV数 *',
-                f'{cur_web_est_cv:,}件',
-                f'{prev_web_est_cv:,}件',
-                f'{cur_web_est_cv - prev_web_est_cv:+,}件',
-            ],
-            [
-                'SNS広告 推定CV数 *',
-                f'{cur_sns_est_cv:,}件',
-                f'{prev_sns_est_cv:,}件',
-                f'{cur_sns_est_cv - prev_sns_est_cv:+,}件',
-            ],
-            [
-                '広告経由 推定CVR *',
-                f'{cur_ad_cvr:.2f}% ({cur_est_cv:,}/{cur_paid_total:,})',
-                f'{prev_ad_cvr:.2f}% ({prev_est_cv:,}/{prev_paid_total:,})',
-                f'{cur_ad_cvr - prev_ad_cvr:+.2f}pt',
+                '広告経由 CV / CVR / 広告費 *',
+                '取得不能（GA4に含まれず）',
+                '取得不能（GA4に含まれず）',
+                '—',
             ],
         ]
         col_ws = [52 * mm, 68 * mm, 68 * mm, 32 * mm]
@@ -1571,19 +1565,20 @@ class CompareReportCanvas:
         note_y = table_top - 5 * mm - (len(rows) + 1) * 7 * mm - 3 * mm
         cv_uncounted = (cur_total_cv == 0 and prev_total_cv == 0)
         if cv_uncounted:
-            self._text(
+            used = self._text_wrapped(
                 margin, note_y,
-                '⚠ 実測CV（キーイベント）が未計測のため、広告経由の推定CV・推定CVRは算出できず0と表示されています。'
-                '広告費対効果の判定には、GA4でのキーイベント設定とGoogle広告連携が必須です。',
-                font_size=6.5,
-                color=colors.HexColor('#B5791F'),
+                '⚠ キーイベント（予約・電話等）自体が未計測です。まずGA4でキーイベントを設定してください。',
+                max_width=PAGE_W - margin * 2,
+                font_size=6.5, color=colors.HexColor('#B5791F'), max_lines=2,
             )
-            note_y -= 4.5 * mm
-        self._text(
+            note_y -= max(used, 1) * 4.5 * mm
+        self._text_wrapped(
             margin, note_y,
-            '* 推定値: GA4のCSVにはチャネル別CV数が含まれないため、広告セッション比率×全体CV数で按分した推定値です。実際の広告経由CV数とは異なる場合があります。',
-            font_size=6.5,
-            color=COLOR_GRAY,
+            '* このCSVにはチャネル別CV数・広告費が含まれないため、広告経由のCV・CVR・CPA・ROASは算出できません。'
+            '旧版の「全体CV×広告セッション比率」による按分は、CVRが全体CVRと同じ値になるだけで広告の成果を'
+            '表さないため廃止しました。判定には広告管理画面の費用・CVとの突合が必要です。',
+            max_width=PAGE_W - margin * 2,
+            font_size=6.5, color=COLOR_GRAY, max_lines=2,
         )
 
         self._footer(company_name, page_num)
@@ -1612,7 +1607,8 @@ class CompareReportCanvas:
             ('表示回数（PV）',
              'ページが表示された回数。同一ユーザーの複数回閲覧もその都度カウント。'),
             ('リピーター',
-             '過去に訪問歴があり再訪問したユーザー。アクティブユーザーから新規ユーザーを除いた数。'),
+             '過去に訪問歴があり再訪問したユーザー。本レポートでは「30日アクティブユーザー − 新規ユーザー」で算出。'
+             '両者は集計窓が1日ずれるため概算値であり、GA4のReturning usersとは完全には一致しない。'),
             ('コホート',
              '同一期間に初回訪問したユーザー群を追跡し、その後の再訪問率・行動変化を分析する手法。'),
             ('重なり率（スティッキネス）',
@@ -1724,9 +1720,10 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
     engage_chart = make_engagement_overlay_chart(
         cur_data['df_engage'], prev_data['df_engage'], cur_label, prev_label)
 
+    # KPIカードと同じユーザー数を使う（日別合計は重複計上のため使わない）
     user_chart = make_new_vs_returning_compare(
-        cur_data['df_new'], cur_data['df_active'],
-        prev_data['df_new'], prev_data['df_active'],
+        cur_kpis.get('new_users', 0), cur_kpis.get('active_users', 0),
+        prev_kpis.get('new_users', 0), prev_kpis.get('active_users', 0),
         cur_label, prev_label)
 
     cohort_chart = make_cohort_chart(
@@ -1751,7 +1748,9 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
     )
 
     # 4. ハイライト計算
-    highlights = compute_highlights(compared_kpis, compared_channels, compared_kevents)
+    highlights = compute_highlights(compared_kpis, compared_channels, compared_kevents,
+                                    cur_pages=cur_data.get('df_pages'),
+                                    prev_pages=prev_data.get('df_pages'))
 
     # 4.5 データ連動の注記（国別の対象範囲・計測期間の完全性）
     country_note = country_note_text(cur_meta)

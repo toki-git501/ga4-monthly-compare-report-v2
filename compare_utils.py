@@ -143,7 +143,8 @@ def compare_key_events(cur_kev: dict, prev_kev: dict) -> list:
 
 
 def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
-                       compared_kevents: list) -> dict:
+                       compared_kevents: list,
+                       cur_pages=None, prev_pages=None) -> dict:
     """P7総括ページ用のハイライト情報を抽出。
 
     Returns:
@@ -197,6 +198,17 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
         },
     }
 
+    # 当月0PVになったページ（前月まで閲覧されていたページの消失）
+    # 上位20表と同じ基準で拾い、総括の確認事項に使う。
+    lost = []
+    if cur_pages is not None or prev_pages is not None:
+        sel = select_top_pages(cur_pages, prev_pages, 20)
+        if not sel.empty and 'status' in sel.columns:
+            lost = (sel[sel['status'] == 'lost']
+                    .sort_values('prev', ascending=False)
+                    .to_dict('records'))
+    highlights['lost_pages'] = lost
+
     # チャネルで最も変動が大きいもの
     if not compared_channels.empty and 'diff' in compared_channels.columns:
         key_col = compared_channels.columns[0]
@@ -228,11 +240,20 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
             bullets.append(f"{label}: {format_delta(d)}")
     highlights['summary_bullets'] = bullets
 
-    # 総括コメント（P7用） - なるべく平易な文体
+    # ─────────────────────────────────────────────────
+    # 総括（P10）の生成
+    #
+    # 設計方針: このCSVから観測できないことを原因として断定しない。
+    #   旧実装は Organic の増減から「検索順位に変動があった」、Direct の増減から
+    #   「メルマガやLINE等のCRM施策」、CV減から「フォームの入力項目数」を推測し、
+    #   広告費データが無いまま「広告予算を増額」を推奨していた。いずれもこのCSVには
+    #   根拠となるデータが存在しない。
+    #   本実装では出力を「観測事実」「次月の確認事項（根拠つき）」に限定し、
+    #   原因が特定できないものは断定せず「どこで確認すべきか」を示す。
+    # ─────────────────────────────────────────────────
     comments = []
-    good_points = []
-    improve_points = []
-    action_items = []
+    facts_up = []       # 増加した指標（観測事実のみ）
+    facts_down = []     # 減少した指標（観測事実のみ）
     headline_lines = []
     ses = compared_kpis.get('sessions', {})
     kev = compared_kpis.get('key_events_total', {})
@@ -240,210 +261,161 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
     new_u = compared_kpis.get('new_users', {})
 
     # CV（キーイベント）が当月・前月とも0 = 実質「未計測」。
-    # この場合、アクセス増減を成果（予約・電話）の良し悪しとして語れないため、
-    # 文言・施策の出し方を切り替える。
+    # この場合、アクセス増減を成果（予約・電話）の良し悪しとして語れない。
     cv_uncounted = (int(kev.get('current', 0)) == 0 and int(kev.get('previous', 0)) == 0)
 
-    if ses.get('pct') is not None:
+    def _pct(d):
+        return abs(d.get('pct', 0) or 0)
+
+    # ---- 観測事実（数値の増減のみ。原因は書かない） ----
+    if ses.get('pct') is not None and ses.get('diff', 0) != 0:
         if ses.get('diff', 0) > 0:
-            headline_lines.append(f"アクセスは前月より {ses.get('pct', 0):.1f}% 増加")
-            good_points.append(f"アクセス数が前月より {ses.get('pct', 0):.1f}% 増えています。")
-            comments.append(
-                f"サイト全体のアクセスは前月より {ses.get('pct', 0):.1f}% 増えました。伸びている流入元の施策は維持し、同じ訴求を他ページにも横展開するのが有効です。"
-            )
-        elif ses.get('diff', 0) < 0:
-            headline_lines.append(f"アクセスは前月より {abs(ses.get('pct', 0)):.1f}% 減少")
-            improve_points.append(f"アクセス数が前月より {abs(ses.get('pct', 0)):.1f}% 減っています。")
-            comments.append(
-                f"サイト全体のアクセスは前月より {abs(ses.get('pct', 0)):.1f}% 減っています。まずは減少した流入元を特定し、広告配信面と検索流入面を分けて対策することを推奨します。"
-            )
+            headline_lines.append(f"アクセス（セッション）は前月より {_pct(ses):.1f}% 増加")
+            facts_up.append(f"セッション数が前月より {_pct(ses):.1f}% 増えました。")
+        else:
+            headline_lines.append(f"アクセス（セッション）は前月より {_pct(ses):.1f}% 減少")
+            facts_down.append(f"セッション数が前月より {_pct(ses):.1f}% 減りました。")
 
-    if new_u.get('pct') is not None:
+    if new_u.get('pct') is not None and new_u.get('diff', 0) != 0:
         if new_u.get('diff', 0) > 0:
-            good_points.append(f"新しく来たユーザーが前月比 {new_u.get('pct', 0):.1f}% 増えました。")
-            comments.append(
-                f"初めて来たユーザーは前月より {new_u.get('pct', 0):.1f}% 増加しました。入口ページの訴求を維持し、予約導線まで一貫したメッセージにそろえると成果につながりやすくなります。"
-            )
-        elif new_u.get('diff', 0) < 0:
-            improve_points.append(f"新しく来たユーザーが前月比 {abs(new_u.get('pct', 0)):.1f}% 減りました。")
-            comments.append(
-                f"初めて来たユーザーは前月より {abs(new_u.get('pct', 0)):.1f}% 減少しました。新規獲得用の広告文や検索流入の入口ページを優先して見直すのが効果的です。"
-            )
+            facts_up.append(f"新規ユーザーが前月より {_pct(new_u):.1f}% 増えました。")
+        else:
+            facts_down.append(f"新規ユーザーが前月より {_pct(new_u):.1f}% 減りました。")
 
-    if kev.get('pct') is not None:
+    if not cv_uncounted and kev.get('pct') is not None and kev.get('diff', 0) != 0:
         if kev.get('diff', 0) > 0:
-            headline_lines.append(f"予約・電話の成果は前月比 {kev.get('pct', 0):.1f}% 増加")
-            good_points.append(f"予約や電話などの成果数が前月比 {kev.get('pct', 0):.1f}% 増えています。")
-            comments.append(
-                f"予約や電話などの成果アクションは前月比 {kev.get('pct', 0):.1f}% 増えています。成果が出た導線は残しつつ、同じ構成を他の上位ページへ展開するのがおすすめです。"
-            )
-        elif kev.get('diff', 0) < 0:
-            headline_lines.append(f"予約・電話の成果は前月比 {abs(kev.get('pct', 0)):.1f}% 減少")
-            improve_points.append(f"予約や電話などの成果数が前月比 {abs(kev.get('pct', 0)):.1f}% 減っています。")
-            comments.append(
-                f"予約や電話などの成果アクションは前月比 {abs(kev.get('pct', 0)):.1f}% 減っています。予約ボタンの位置・文言・電話導線の見やすさを優先して改善したい状況です。"
-            )
+            headline_lines.append(f"キーイベント（予約・電話等）は前月比 {_pct(kev):.1f}% 増加")
+            facts_up.append(f"キーイベント（予約・電話等）が前月比 {_pct(kev):.1f}% 増えました。")
+        else:
+            headline_lines.append(f"キーイベント（予約・電話等）は前月比 {_pct(kev):.1f}% 減少")
+            facts_down.append(f"キーイベント（予約・電話等）が前月比 {_pct(kev):.1f}% 減りました。")
 
-    if eng.get('pct') is not None:
+    if eng.get('pct') is not None and eng.get('diff', 0) != 0:
         if eng.get('diff', 0) > 0:
-            good_points.append(f"ユーザーのページ滞在は前月比 {eng.get('pct', 0):.1f}% 改善しています。")
-            comments.append(
-                f"1ユーザーあたりの利用時間は前月より {eng.get('pct', 0):.1f}% 伸びています。読まれているページの構成をテンプレート化すると全体改善につながります。"
-            )
-        elif eng.get('diff', 0) < 0:
-            improve_points.append(f"ユーザーのページ滞在は前月比 {abs(eng.get('pct', 0)):.1f}% 低下しています。")
-            comments.append(
-                f"1ユーザーあたりの利用時間は前月より {abs(eng.get('pct', 0)):.1f}% 短くなりました。離脱しやすい上位ページから先に改善対象として着手するのが効率的です。"
-            )
+            facts_up.append(f"平均エンゲージメント時間が前月比 {_pct(eng):.1f}% 伸びました。")
+        else:
+            facts_down.append(f"平均エンゲージメント時間が前月比 {_pct(eng):.1f}% 短くなりました。")
 
-    # CV未計測時のカウント注意（アクセス増減を成果として誤読させないため）
     if cv_uncounted:
         headline_lines.append('成果（予約・電話等）は未計測のため、アクセスの増減は参考値です')
-        improve_points.append(
-            '予約・電話などの成果（キーイベント）が未計測のため、アクセス増が予約・新患獲得につながったかは判断できません。'
-            'GA4でのキーイベント設定が最優先課題です。'
+        facts_down.append(
+            'キーイベント（予約・電話等）が未計測のため、アクセスの増減が来院につながったかは判断できません。'
         )
 
-    # --- 優先施策ハイライト（優先度スコア付き、上位2件を選定） ---
-    # (priority, action_text) のリスト。priorityが大きいほど優先
+    # ---- 次月の確認事項（根拠つき／原因は断定しない） ----
+    # (priority, text) 。priority が大きいほど優先。
     scored_actions = []
 
-    ses_up = ses.get('diff', 0) > 0
-    ses_down = ses.get('diff', 0) < 0
-    kev_up = kev.get('diff', 0) > 0
-    kev_down = kev.get('diff', 0) < 0
-    eng_up = eng.get('diff', 0) > 0
-    eng_down = eng.get('diff', 0) < 0
-    new_up = new_u.get('diff', 0) > 0
-    new_down = new_u.get('diff', 0) < 0
+    if cv_uncounted:
+        scored_actions.append((200,
+            'GA4で予約ボタン・電話タップ・問い合わせ送信をキーイベントに設定し、成果を計測できる状態にする。'
+            'これが無い限り、集客施策も広告も効果を評価できない。'
+            '（根拠: 当月・前月ともキーイベント0件）'))
 
-    ses_pct = abs(ses.get('pct', 0) or 0)
-    kev_pct = abs(kev.get('pct', 0) or 0)
-    eng_pct = abs(eng.get('pct', 0) or 0)
-    new_pct = abs(new_u.get('pct', 0) or 0)
-
-    # ---- セッション × CV の組み合わせ（最も影響が大きい） ----
-    if ses_up and kev_up:
-        scored_actions.append((50,
-            '好調な流入元の広告予算を維持または増額し、同じ訴求を他のページにも横展開して成果拡大を狙う。'))
-        scored_actions.append((45,
-            '成果が出ているページの構成（見出し・CTA配置・安心材料の順序）をテンプレート化し、他ページにも適用する。'))
-    elif ses_up and kev_down:
-        # CVが下がっている → CVR改善が最優先
-        scored_actions.append((100 + kev_pct,
-            'アクセスは増えているのにCVが減少 → 予約ボタンの位置・文言・フォーム入力ステップを優先的に見直す。'))
-        scored_actions.append((90 + kev_pct,
-            '流入が増えたページのファーストビューに「予約の流れ」や「初診の方へ」など安心材料を追加してCV率を改善する。'))
-    elif ses_down and kev_up:
-        # アクセス減 → 集客回復が最優先
-        scored_actions.append((100 + ses_pct,
-            'CV率は改善傾向 → アクセス回復のため、検索上位ページのタイトル・メタディスクリプションを見直し流入を増やす。'))
-        scored_actions.append((85 + ses_pct,
-            '広告経由の集客を強化。成果が出ているCV導線はそのまま維持し、入口のアクセス数を増やすことで成果総数を伸ばす。'))
-    elif ses_down and kev_down:
-        # 両方減少 → 最も緊急度が高い
-        scored_actions.append((120 + ses_pct + kev_pct,
-            'アクセス・CV共に減少 → まず減少した流入チャネルを特定し、広告配信面と検索流入面を分けて原因を調査する。'))
-        scored_actions.append((110 + ses_pct + kev_pct,
-            '上位ページの離脱率が高い可能性。ファーストビューの見出しをユーザーの検索意図に合わせ、主要ボタンを1つに絞る。'))
-    elif cv_uncounted and (ses_up or ses_down):
-        # CVが未計測（0/0）でアクセスだけが増減しているケース。
-        # 旧実装ではこの分岐が無く「主要指標は横ばい」に誤って落ちていた。
-        scored_actions.append((115 + ses_pct,
-            'アクセスは大きく変動しているが、予約・電話などの成果（キーイベント）が未計測。'
-            'まずGA4で予約ボタン・電話タップ・問い合わせ導線をキーイベント設定し、成果を計測できる状態にする。'))
-        if ses_up:
-            scored_actions.append((70 + ses_pct,
-                'アクセス増を成果につなげるため、流入が増えた上位ページのファーストビューに'
-                '予約導線（ボタン・電話番号・初診の流れ）を明確に配置する。'))
-    elif ses_up:
-        # アクセス増（CVは増減判定できないが計測はある/フラット）
-        scored_actions.append((60 + ses_pct,
-            'アクセスは増加 → 伸びた流入元の訴求を維持しつつ、成果につながりやすい上位ページの予約導線を優先的に強化する。'))
-    elif ses_down:
-        scored_actions.append((100 + ses_pct,
-            'アクセスは減少 → 減少した流入チャネルを特定し、検索上位ページのタイトル・メタディスクリプションと広告配信を見直す。'))
-    else:
-        scored_actions.append((30,
-            '主要指標は横ばい → 現状維持しつつ、上位ページで小規模なA/Bテスト（見出し変更・CTA色変更等）を実施して改善の余地を探る。'))
-
-    # ---- エンゲージメント系 ----
-    if eng_down:
-        scored_actions.append((70 + eng_pct,
-            'エンゲージ時間低下 → 上位ページの冒頭に要点を簡潔にまとめ、スクロールを促す目次やアンカーリンクを追加する。'))
-    elif eng_up and kev_down:
-        scored_actions.append((80 + eng_pct,
-            '滞在時間は伸びているがCVに至っていない → ページ内にCTAボタンを複数箇所（冒頭・中盤・末尾）に配置して導線を強化する。'))
-
-    # ---- 新規ユーザー系 ----
-    if new_down and ses_up:
-        scored_actions.append((65 + new_pct,
-            'リピーター中心の構成 → 新規向けのランディングページを整備し、初回訪問者向けの訴求（実績・口コミ・アクセス方法）を強化する。'))
-    elif new_up and kev_down:
-        scored_actions.append((75 + new_pct,
-            '新規ユーザーは増えているが成果未達 → 初回訪問者向けにわかりやすい予約フローと初診案内を目立つ位置に配置する。'))
-
-    # ---- チャネル系（変動幅に応じた優先度） ----
+    # チャネルの変動: GA4のこのCSVでは「なぜ変わったか」は分からない。確認先を示す。
     top_ch = highlights.get('top_channel_change', {})
-    if top_ch.get('name') and top_ch.get('name') != '-':
-        ch_name = top_ch.get('name')
-        ch_diff_d = calc_diff(
-            compared_channels.loc[compared_channels[compared_channels.columns[0]] == ch_name, 'cur_val'].values[0],
-            compared_channels.loc[compared_channels[compared_channels.columns[0]] == ch_name, 'prev_val'].values[0],
-        ) if not compared_channels.empty and ch_name in compared_channels[compared_channels.columns[0]].values else {}
-        ch_impact = abs(ch_diff_d.get('pct', 0) or 0)
+    ch_name = top_ch.get('name')
+    if ch_name and ch_name != '-':
+        ch_impact = 0.0
+        try:
+            key_col = compared_channels.columns[0]
+            row = compared_channels.loc[compared_channels[key_col] == ch_name]
+            if not row.empty:
+                ch_impact = abs(calc_diff(row['cur_val'].values[0],
+                                          row['prev_val'].values[0]).get('pct', 0) or 0)
+        except (KeyError, IndexError, AttributeError):
+            ch_impact = 0.0
+        ch_delta = top_ch.get('delta', '')
+        ch_basis = f'（根拠: {ch_name} セッション {ch_delta}）'
+        name_l = str(ch_name)
 
-        if 'Organic' in str(ch_name):
-            scored_actions.append((55 + ch_impact,
-                f'「{ch_name}」の変動が大きい → 検索順位に変動があった可能性。上位表示ページのコンテンツ鮮度を確認し、最新情報に更新する。'))
-        elif 'Paid' in str(ch_name):
+        if 'Organic' in name_l and 'Social' not in name_l:
+            scored_actions.append((80 + ch_impact,
+                f'自然検索の変動が最も大きい。GA4には検索語・掲載順位が含まれないため、'
+                f'Search Consoleで表示回数・クリック数・平均掲載順位・クエリの変化を確認する。{ch_basis}'))
+        elif 'Paid' in name_l or 'Cross-network' in name_l:
+            scored_actions.append((85 + ch_impact,
+                f'広告流入の変動が最も大きい。GA4には広告費が含まれないため、'
+                f'広告管理画面で費用・CPA・コンバージョンを確認したうえで配信量の判断を行う。{ch_basis}'))
+        elif 'Direct' in name_l:
             scored_actions.append((60 + ch_impact,
-                f'「{ch_name}」の変動が大きい → 広告のクリック率・品質スコアを確認し、広告文とLP内容の一貫性を見直す。'))
-        elif 'Direct' in str(ch_name):
-            scored_actions.append((40 + ch_impact,
-                f'「{ch_name}」の変動が大きい → ブックマーク・リピート訪問に変化あり。メルマガやLINE等のCRM施策の効果を確認する。'))
+                f'Direct（参照元不明の流入）の変動が最も大きい。GA4では要因を特定できないため、'
+                f'チラシ・看板・紹介・院内掲示など、オフライン接点の実施状況を院内で確認する。{ch_basis}'))
         else:
-            scored_actions.append((50 + ch_impact,
-                f'「{ch_name}」向けの入口ページを先に改善。ファーストビューの見出しを検索意図に合わせ、主要ボタンを1つに絞る。'))
+            scored_actions.append((60 + ch_impact,
+                f'「{ch_name}」の変動が最も大きい。GA4の「参照元/メディア」で内訳を確認し、'
+                f'どのサイトからの流入が動いたかを特定する。{ch_basis}'))
         comments.append(
-            f"流入元では「{ch_name}」の変動が最も大きく、今月の結果に強く影響した可能性があります。"
+            f'流入元では「{ch_name}」の増減が最も大きく {ch_delta} でした。'
+            'この数字は流入量の変化を示すもので、原因はGA4のこのデータからは特定できません。'
         )
 
-    # ---- キーイベント系 ----
-    top_kev = highlights.get('top_kevent_change', {})
-    if top_kev.get('name') and top_kev.get('name') != '-':
-        kev_name = top_kev.get('name')
-        kev_impact = abs(top_kev.get('delta', '') and kev_pct)
+    # セッションとキーイベントの組み合わせ（CVが計測されている場合のみ）
+    if not cv_uncounted:
+        ses_up = ses.get('diff', 0) > 0
+        ses_down = ses.get('diff', 0) < 0
+        kev_up = kev.get('diff', 0) > 0
+        kev_down = kev.get('diff', 0) < 0
+        if ses_up and kev_down:
+            scored_actions.append((150 + _pct(kev),
+                'アクセスは増えたがキーイベントは減少。流入が増えたページと、キーイベントが'
+                '発生しているページを突き合わせ、導線が途切れている箇所を特定する。'
+                f'（根拠: セッション +{_pct(ses):.1f}% / キーイベント -{_pct(kev):.1f}%）'))
+        elif ses_down and kev_down:
+            scored_actions.append((160 + _pct(ses) + _pct(kev),
+                'アクセス・キーイベントとも減少。まず減少した流入チャネルを特定し、'
+                '自然検索ならSearch Console、広告なら広告管理画面で個別に要因を確認する。'
+                f'（根拠: セッション -{_pct(ses):.1f}% / キーイベント -{_pct(kev):.1f}%）'))
+        elif ses_down and kev_up:
+            scored_actions.append((120 + _pct(ses),
+                'アクセスは減ったがキーイベントは増加。成果につながっている流入元を特定し、'
+                'その流入量を戻せるかを確認する。'
+                f'（根拠: セッション -{_pct(ses):.1f}% / キーイベント +{_pct(kev):.1f}%）'))
+        elif ses_up and kev_up:
+            scored_actions.append((70,
+                'アクセス・キーイベントとも増加。どの流入元とページが伸びたかを特定し、'
+                '再現できる要因かを確認する。'
+                f'（根拠: セッション +{_pct(ses):.1f}% / キーイベント +{_pct(kev):.1f}%）'))
+    elif ses.get('diff', 0) != 0:
+        direction = '増加' if ses.get('diff', 0) > 0 else '減少'
+        scored_actions.append((90 + _pct(ses),
+            f'アクセスが{direction}した要因を、チャネル別・ページ別の増減から切り分ける。'
+            f'（根拠: セッション {format_delta(ses)}）'))
 
-        if '電話' in str(kev_name).lower() or 'tel' in str(kev_name).lower():
-            scored_actions.append((60 + kev_impact,
-                f'「{kev_name}」の変動が目立つ → 電話ボタンの視認性（色・サイズ・スクロール追従）を確認し、営業時間の明記を徹底する。'))
-        elif '予約' in str(kev_name).lower():
-            scored_actions.append((65 + kev_impact,
-                f'「{kev_name}」の変動が目立つ → 予約フォームの入力項目数を見直し、必須項目を最小限にしてCV率を改善する。'))
-        else:
-            scored_actions.append((55 + kev_impact,
-                f'「{kev_name}」につながる導線を強化。上位3ページのCTAボタン文言を統一し、スクロール追従ボタンの追加を検討する。'))
-        comments.append(
-            f"成果アクションでは「{kev_name}」の変化が目立ちました。次月はこの導線の継続改善が有効です。"
-        )
+    # 上位ページの消失（select_top_pages と同じ観点。ページデータがある場合のみ）
+    lost_pages = highlights.get('lost_pages') or []
+    if lost_pages:
+        top_lost = lost_pages[0]
+        scored_actions.append((140,
+            f'前月まで閲覧されていた「{top_lost["page"]}」が当月0件になっている。'
+            'ページの削除・URL変更・タイトル変更のいずれかが起きた可能性があるため、'
+            f'サイト側の変更履歴を確認する。（根拠: 前月 {top_lost["prev"]:,}PV → 当月 0PV）'))
 
-    # 優先度順にソートし、上位2件を選定
+    # エンゲージメント時間（原因は書かず、確認対象を示す）
+    if eng.get('diff', 0) < 0 and _pct(eng) >= 5:
+        scored_actions.append((50 + _pct(eng),
+            '平均エンゲージメント時間が低下。上位ページのどれで滞在が短くなったかは'
+            'このCSVでは分からないため、GA4のページ別レポートで確認する。'
+            f'（根拠: 平均エンゲージメント時間 {format_delta(eng)}）'))
+
+    # 優先度順に上位2件
     scored_actions.sort(key=lambda x: x[0], reverse=True)
     action_items = [text for _, text in scored_actions[:2]]
     if not action_items:
-        action_items = ['上位ページの見出しと導線を見直し、反応率の改善を優先。']
+        action_items = ['主要指標に大きな変動はなし。次月も同じ指標で推移を確認する。']
 
     comments.append(
-        "次月は、アクセスが伸びた流入元を維持しつつ、成果につながりやすいページを優先して改善する進め方が現実的です。"
+        '本レポートはGA4のスナップショットCSVのみを入力としています。'
+        '検索順位・広告費・フォームの離脱箇所は含まれないため、原因の特定には'
+        'Search Console・広告管理画面・サイト側の変更履歴の確認が必要です。'
     )
 
     if not headline_lines:
         headline_lines = ['主要指標は前月と大きな差がなく、横ばいで推移']
-    if not good_points:
-        good_points = ['大きな悪化は見られず、基盤は維持できています。']
-    if not improve_points:
-        improve_points = ['次月は成果につながるページの改善余地を優先確認。']
+    # 「大きな悪化は見られず基盤は維持」という定型文は、全指標が下落した月にも
+    # 出てしまい実態と矛盾していたため廃止。増加が無ければ「なし」と明示する。
+    good_points = facts_up if facts_up else ['増加した主要指標はありませんでした。']
+    improve_points = facts_down if facts_down else ['減少した主要指標はありませんでした。']
 
     highlights['headline_lines'] = headline_lines[:3]
     highlights['good_points'] = good_points[:3]
