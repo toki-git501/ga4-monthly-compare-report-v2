@@ -118,6 +118,16 @@ def parse_ga4_csv(filepath_or_bytes) -> dict:
         'end':      end_d.group(1) if end_d else '',
     }
 
+    # GA4のどの画面から出力されたCSVかを識別する。
+    # 「集客サマリー」は上位ページやエンゲージメント時間を含まないため、
+    # Streamlit側で誤ったPDF生成を止める判定に使う。
+    source_report = re.search(
+        r'^#\s*(レポートのスナップショット|集客サマリー)\s*$',
+        raw,
+        re.MULTILINE,
+    )
+    meta['source_report'] = source_report.group(1) if source_report else ''
+
     # 日付表示用
     if meta['end']:
         d = meta['end']

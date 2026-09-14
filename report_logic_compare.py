@@ -33,7 +33,7 @@ from csv_parser import parse_ga4_csv
 # 出力PDFに刻む生成バージョン。
 # デプロイが反映されたかを、出力物そのもので判定できるようにするため。
 # ロジックを変更したら必ず更新すること。
-REPORT_VERSION = '2026-08-13-v4'
+REPORT_VERSION = '2026-09-14-v5'
 from compare_utils import (
     calc_diff, format_delta, delta_color,
     compare_kpis, compare_dataframes, compare_key_events, compute_highlights,

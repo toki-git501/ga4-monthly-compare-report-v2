@@ -3,7 +3,7 @@
 AIエージェント（Codex / Claude Code / Cowork）が本リポジトリで作業を再開するための指示書。
 **作業前に必ず全文を読むこと。** 特に「絶対に戻してはいけない修正」と「既知の罠」。
 
-最終更新: 2026-08-13 / 現行バージョン: `2026-08-13-v4`
+最終更新: 2026-09-14 / 現行バージョン: `2026-09-14-v5`
 
 ---
 
@@ -42,7 +42,7 @@ compare_utils.py            当月vs前月の差分計算、上位ページ選�
 chart_generator_compare.py  matplotlibチャート生成
 report_logic_compare.py     PDF描画（reportlab）。REPORT_VERSION の定義元
 ipaexg.ttf                  日本語フォント（同梱必須。japanize-matplotlibは使わない）
-tests/                      pytest（41件）
+tests/                      pytest（45件）
 tests/fixtures/             匿名化済みCSV
 tests/_anonymize_fixtures.py フィクスチャ匿名化スクリプト
 .github/workflows/tests.yml CI
@@ -121,6 +121,13 @@ KPIカードと同じ `active_users` / `new_users` から算出する。
 「再エクスポートしてくださ」で、総括の次月アクションが「…をキーイ」で途切れていた。
 ボックス高さは `_wrap_lines()` で行数を実測してから決めること（決め打ちにしない）。
 
+### 3-8. 必須項目が欠けたCSVではPDFを生成しない
+
+GA4の「集客サマリー」CSVには、上位ページ・平均エンゲージメント時間・30日/7日/1日
+アクティブユーザーなどが含まれない。このCSVを旧実装へ入れると、空白ページや0件を含む
+誤ったPDFが生成された。`input_validation.py` の必須項目検査を外さず、エラー時に
+`st.stop()` で生成を止めること。
+
 ---
 
 ## 4. 開発フロー
@@ -132,7 +139,7 @@ cd ~/Projects/ga4-monthly-compare-report-v2
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt pytest pdfplumber
 
-# テスト（41件）
+# テスト（45件）
 .venv/bin/python -m pytest tests/ -q
 
 # ローカル起動
@@ -158,8 +165,8 @@ python3 -m venv .venv
 
 反映されたかは**バージョン表記**で判定する。
 
-- 画面フッター: `© 2026 MOCAL株式会社 | GA4 月次比較レポート | v2026-08-13-v4`
-- 生成PDFの11ページ目（用語解説）の注記: `• 本レポートの生成バージョン: v2026-08-13-v4`
+- 画面フッター: `© 2026 MOCAL株式会社 | GA4 月次比較レポート | v2026-09-14-v5`
+- 生成PDFの11ページ目（用語解説）の注記: `• 本レポートの生成バージョン: v2026-09-14-v5`
 
 `REPORT_VERSION` を上げずにpushすると、この判定ができなくなる。**必ず上げること。**
 
@@ -210,6 +217,8 @@ Codex gpt-5.6-sol の設計レビューで指摘されたが、今回のスコ�
 - **2026-08-13 本改修（v4）** — クララスデンタル2院の7月レポートを実CSVと突合したレビューを起点に、
   指標定義の誤り6件と描画欠陥2件を修正。テスト41件とCIを新設。
   詳細は `Vault/85_Scripts/092_開発/GA4月次比較レポートv2/2026-08-13_指標定義の是正と検証基盤の整備.md`
+- **2026-09-14 v5** — GA4「集客サマリー」など必須項目が不足したCSVを検知し、
+  空白・0件の誤ったPDFを生成せず再出力案内を表示する入力検証を追加。
 
 ---
 

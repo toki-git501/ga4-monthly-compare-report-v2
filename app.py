@@ -6,6 +6,7 @@ import traceback
 from datetime import datetime
 from report_logic_compare import generate_compare_report
 from csv_parser import parse_ga4_csv
+from input_validation import validate_csv_inputs
 
 # バージョンはPDF生成側と共有する（出力物からデプロイ状態を判定できるようにするため）
 from report_logic_compare import REPORT_VERSION as APP_VERSION
@@ -40,30 +41,6 @@ def display_pdf(pdf_bytes):
     except Exception as e:
         st.info("プレビュー表示に失敗したため、PDFはダウンロードしてご確認ください。")
         st.caption(f"preview error: {e}")
-
-def validate_csvs(cur_bytes, prev_bytes):
-    """2つのCSVのバリデーション。エラーがあればメッセージを返す。"""
-    errors = []
-    try:
-        cur_data = parse_ga4_csv(cur_bytes)
-        prev_data = parse_ga4_csv(prev_bytes)
-    except Exception as e:
-        return [f"CSVの解析に失敗しました: {e}"]
-
-    # 同一プロパティ確認
-    cur_prop = cur_data['meta'].get('property', '')
-    prev_prop = prev_data['meta'].get('property', '')
-    if cur_prop and prev_prop and cur_prop != prev_prop:
-        errors.append(f"プロパティが一致しません。当月: {cur_prop} / 比較月: {prev_prop}")
-
-    # 期間の前後確認
-    cur_end = cur_data['meta'].get('end', '')
-    prev_end = prev_data['meta'].get('end', '')
-    if cur_end and prev_end and cur_end <= prev_end:
-        errors.append(f"当月の終了日({cur_end})が比較月の終了日({prev_end})以前です。アップロード先を確認してください。")
-
-    return errors
-
 
 def data_advisories(cur_bytes, prev_bytes, single_mode):
     """生成前に注意喚起すべきデータ品質上のアドバイスを返す（エラーではない）。"""
@@ -249,12 +226,19 @@ with col2:
             cur_bytes = uploaded_cur.getvalue()
             prev_bytes = cur_bytes if single_mode else uploaded_prev.getvalue()
 
-            # バリデーション
-            if not single_mode:
-                validation_errors = validate_csvs(cur_bytes, prev_bytes)
-                if validation_errors:
-                    for err in validation_errors:
-                        st.warning(err)
+            # 必須項目・出力元・比較条件に問題がある場合は生成を止める。
+            validation_errors = validate_csv_inputs(
+                cur_bytes,
+                None if single_mode else prev_bytes,
+            )
+            if validation_errors:
+                for err in validation_errors:
+                    st.error(err)
+                st.info(
+                    "GA4で「レポート」→「レポートのスナップショット」を開き、"
+                    "同じ期間を指定してCSVを再出力してください。"
+                )
+                st.stop()
 
             # データ品質アドバイス（不完全な計測期間・海外アクセス混入）
             for adv in data_advisories(cur_bytes, prev_bytes, single_mode):

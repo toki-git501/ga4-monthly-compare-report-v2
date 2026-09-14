@@ -25,6 +25,7 @@ sys.path.insert(0, BASE)
 FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fixtures')
 
 from csv_parser import parse_ga4_csv  # noqa: E402
+from input_validation import validate_csv_inputs, validate_report_data  # noqa: E402
 from compare_utils import (  # noqa: E402
     compare_kpis, compare_dataframes, compare_key_events,
     compute_highlights, select_top_pages,
@@ -87,6 +88,40 @@ class TestParser:
         assert c['available'] is True
         assert c['jp'] + (c['total'] - c['jp']) == c['total']
         assert 0 < c['jp_share'] <= 1
+
+    def test_CSV出力元を識別できる(self, cur, prev):
+        assert cur['meta']['source_report'] == 'レポートのスナップショット'
+        assert prev['meta']['source_report'] == 'レポートのスナップショット'
+
+
+# ─────────────────────────────────────────────
+# 入力バリデーション
+# ─────────────────────────────────────────────
+class TestInputValidation:
+    def test_正しいスナップショットCSVは受け付ける(self, cur, prev):
+        assert validate_report_data(cur, '当月CSV') == []
+        assert validate_report_data(prev, '比較月CSV') == []
+        assert validate_csv_inputs(CUR, PREV) == []
+
+    def test_集客サマリーは生成を拒否する(self):
+        bad_csv = b"""# ----------------------------------------
+# Acquisition summary
+# \xe9\x9b\x86\xe5\xae\xa2\xe3\x82\xb5\xe3\x83\x9e\xe3\x83\xaa\xe3\x83\xbc
+# Start: 20260801
+# End: 20260831
+N day,active users
+0000,10
+"""
+        errors = validate_csv_inputs(bad_csv)
+        assert any('集客サマリー' in err for err in errors)
+        assert any('必要な項目がありません' in err for err in errors)
+
+    def test_ページ表欠落を0件として扱わない(self, cur):
+        incomplete = dict(cur)
+        incomplete['df_pages'] = None
+        errors = validate_report_data(incomplete, '当月CSV')
+        assert any('上位ページ' in err for err in errors)
+        assert any('PDFは生成できません' in err for err in errors)
 
 
 # ─────────────────────────────────────────────

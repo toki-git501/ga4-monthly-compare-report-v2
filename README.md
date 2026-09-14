@@ -4,7 +4,7 @@
 月次比較PDFを生成するStreamlitアプリ。
 
 **本番**: https://ga4-monthly-compare-report-v2.streamlit.app/
-**現行バージョン**: `2026-08-13-v4`
+**現行バージョン**: `2026-09-14-v5`
 
 ---
 
@@ -22,13 +22,16 @@
 
 比較月のCSVを指定しない場合は単月モードになります。
 
+「集客サマリー」など、必要項目が不足したCSVをアップロードした場合は、
+空白や0件を含む誤ったPDFを生成せず、再出力手順を画面に表示して停止します。
+
 ## 開発
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt pytest pdfplumber
 
-.venv/bin/python -m pytest tests/ -q   # テスト41件
+.venv/bin/python -m pytest tests/ -q   # テスト45件
 .venv/bin/streamlit run app.py          # ローカル起動
 ```
 
