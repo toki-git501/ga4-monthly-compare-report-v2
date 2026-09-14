@@ -17,6 +17,7 @@
 """
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -28,7 +29,7 @@ from csv_parser import parse_ga4_csv  # noqa: E402
 from input_validation import validate_csv_inputs, validate_report_data  # noqa: E402
 from compare_utils import (  # noqa: E402
     compare_kpis, compare_dataframes, compare_key_events,
-    compute_highlights, select_top_pages,
+    compute_highlights, select_top_pages, format_delta,
 )
 
 CUR = os.path.join(FIX, 'sample_cur.csv')            # 31日ある月
@@ -92,6 +93,21 @@ class TestParser:
     def test_CSV出力元を識別できる(self, cur, prev):
         assert cur['meta']['source_report'] == 'レポートのスナップショット'
         assert prev['meta']['source_report'] == 'レポートのスナップショット'
+
+    def test_キーイベントの0件と未出力を区別する(self, cur):
+        assert cur['kpis']['key_events_status'] == 'configured_zero'
+        assert cur['kpis']['key_events_total'] == 0
+
+        missing = parse_ga4_csv(b'# no key event section\n')
+        assert missing['kpis']['key_events_status'] == 'missing'
+        assert missing['kpis']['key_events_total'] == 0
+
+    def test_キーイベント明細があれば出力済みと判定する(self):
+        data = parse_ga4_csv(
+            'イベント名,キーイベント\nweb予約,3\n\n'.encode('utf-8')
+        )
+        assert data['kpis']['key_events_status'] == 'available'
+        assert data['kpis']['key_events_total'] == 3
 
 
 # ─────────────────────────────────────────────
@@ -239,6 +255,16 @@ class TestHighlights:
         assert hl_paid['lost_pages'], '消失ページが highlights に入っていない'
         assert any('0PV' in a or '0件' in a for a in hl_paid['action_items'])
 
+    def test_キーイベント未出力は前月比を計算しない(self):
+        compared = compare_kpis(
+            {'key_events_total': 0, 'key_events_status': 'missing'},
+            {'key_events_total': 8, 'key_events_status': 'available'},
+        )
+        key_events = compared['key_events_total']
+        assert key_events['comparable'] is False
+        assert key_events['pct'] is None
+        assert format_delta(key_events) == '比較不能（未出力）'
+
 
 # ─────────────────────────────────────────────
 # PDF生成（描画の回帰）
@@ -285,6 +311,13 @@ class TestPdf:
         all_text = '\n'.join(pdf_text)
         assert '推定CVR' not in all_text
         assert '推定CV数' not in all_text
+
+    def test_キーイベントを予約完了やCVRと誤称しない(self, pdf_text):
+        all_text = '\n'.join(pdf_text)
+        assert 'キーイベント発生回数比較' in all_text
+        assert '予約完了' not in all_text
+        assert '当月CVR' not in all_text
+        assert '前月CVR' not in all_text
 
     def test_注記が右端で切れていない(self, pdf_text):
         """1行描画で文が途切れていた不具合の回帰テスト。"""
@@ -346,6 +379,20 @@ class TestPdfPaid:
                     f'p{i}: 本文がフッター線に食い込んでいる（下端 {lowest:.1f}mm）'
                 )
 
+    def test_生成バージョン注記がフッターより上にある(self, paid_pdf):
+        import pdfplumber
+        from report_logic_compare import REPORT_VERSION
+
+        with pdfplumber.open(paid_pdf) as doc:
+            page = doc.pages[-1]
+            words = page.extract_words()
+        version_words = [w for w in words if REPORT_VERSION in w['text']]
+        assert version_words, '生成バージョン注記が見つからない'
+        bottom_mm = min((page.height - w['bottom']) / 72 * 25.4 for w in version_words)
+        assert bottom_mm >= 10.0, (
+            f'生成バージョン注記がフッターに近すぎる（下端 {bottom_mm:.1f}mm）'
+        )
+
 
 class TestRobustness:
     def test_同じCSVを当月前月に与えても落ちない(self, tmp_path):
@@ -361,3 +408,65 @@ class TestRobustness:
         out = tmp_path / 'std.pdf'
         generate_compare_report(CUR, PREV, str(out), company_name='標準', detailed=False)
         assert out.exists()
+
+    def test_キーイベント明細があるPDFは参考比率と明記する(self, tmp_path):
+        pytest.importorskip('reportlab')
+        pdfplumber = pytest.importorskip('pdfplumber')
+        from report_logic_compare import generate_compare_report
+
+        cur_text = Path(CUR).read_text(encoding='utf-8').replace(
+            'イベント名,キーイベント\n\n',
+            'イベント名,キーイベント\nweb予約,5\n\n',
+            1,
+        )
+        prev_text = Path(PREV).read_text(encoding='utf-8').replace(
+            'イベント名,キーイベント\n\n',
+            'イベント名,キーイベント\nweb予約,4\n\n',
+            1,
+        )
+        cur_path = tmp_path / 'cur-with-key-events.csv'
+        prev_path = tmp_path / 'prev-with-key-events.csv'
+        cur_path.write_text(cur_text, encoding='utf-8')
+        prev_path.write_text(prev_text, encoding='utf-8')
+        out = tmp_path / 'with-key-events.pdf'
+
+        generate_compare_report(
+            str(cur_path), str(prev_path), str(out),
+            company_name='参考比率テスト', detailed=False,
+        )
+        with pdfplumber.open(str(out)) as doc:
+            text = '\n'.join(p.extract_text() or '' for p in doc.pages)
+        assert '当月参考比率' in text
+        assert '前月参考比率' in text
+        assert 'GA4のセッションCVRではなく' in text
+        assert '予約・電話アクション 小計' in text
+
+    def test_キーイベント未出力のPDFは0件減少にしない(self, tmp_path):
+        pytest.importorskip('reportlab')
+        pdfplumber = pytest.importorskip('pdfplumber')
+        from report_logic_compare import generate_compare_report
+
+        cur_text = Path(CUR).read_text(encoding='utf-8')
+        cur_text = cur_text.replace('イベント名,キーイベント', 'イベント名,重要イベント')
+        cur_text = cur_text.replace('プラットフォーム,キーイベント', 'プラットフォーム,重要イベント')
+        prev_text = Path(PREV).read_text(encoding='utf-8').replace(
+            'イベント名,キーイベント\n\n',
+            'イベント名,キーイベント\nweb予約,8\n\n',
+            1,
+        )
+        cur_path = tmp_path / 'cur-without-key-events.csv'
+        prev_path = tmp_path / 'prev-with-key-events.csv'
+        cur_path.write_text(cur_text, encoding='utf-8')
+        prev_path.write_text(prev_text, encoding='utf-8')
+        out = tmp_path / 'missing-key-events.pdf'
+
+        generate_compare_report(
+            str(cur_path), str(prev_path), str(out),
+            company_name='未出力テスト', detailed=False,
+        )
+        with pdfplumber.open(str(out)) as doc:
+            text = '\n'.join(p.extract_text() or '' for p in doc.pages)
+        assert '当月 未出力 / 前月 8件（比較不能）' in text
+        assert 'キーイベント比較不能' in text
+        assert '未出力を0件として扱っていません' in text
+        assert 'キーイベント発生回数: 0件（前月8件 -8' not in text

@@ -167,7 +167,7 @@ def make_key_events_grouped_bar(cur_kev, prev_kev, cur_label: str, prev_label: s
     ax.grid(True, axis='y', color=MPL_GRID, linewidth=0.8)
     _common_style(ax)
     ax.legend(fontsize=9, framealpha=0, loc='upper right')
-    ax.set_title('キーイベント（コンバージョン）比較', fontsize=11, pad=8, color='#1E2B3A')
+    ax.set_title('キーイベント発生回数比較', fontsize=11, pad=8, color='#1E2B3A')
     fig.tight_layout()
     return fig_to_bytes(fig)
 
@@ -347,7 +347,7 @@ def make_cohort_chart(cur_trend, prev_trend, cur_label: str, prev_label: str,
 
 def make_reservation_compare_chart(cur_kev, prev_kev, cur_label: str, prev_label: str,
                                    width_inch=8, height_inch=4) -> bytes:
-    """予約完了（キーイベント）比較チャート — WEB予約・電話系を抽出"""
+    """予約・電話アクション（キーイベント）比較チャート。"""
     # 予約・電話系のイベントを抽出
     reservation_keywords = ['予約', '電話', 'tel', 'TEL']
 
@@ -405,7 +405,7 @@ def make_reservation_compare_chart(cur_kev, prev_kev, cur_label: str, prev_label
     ax.grid(True, axis='y', color=MPL_GRID, linewidth=0.8)
     _common_style(ax)
     ax.legend(fontsize=9, framealpha=0, loc='upper right')
-    ax.set_title('予約・電話 コンバージョン比較', fontsize=11, pad=8, color='#1E2B3A')
+    ax.set_title('予約・電話アクション 発生回数比較', fontsize=11, pad=8, color='#1E2B3A')
     fig.tight_layout()
     return fig_to_bytes(fig)
 
@@ -420,7 +420,7 @@ def make_reservation_transition_rate_chart(
     width_inch=4.4,
     height_inch=3.0,
 ) -> bytes:
-    """予約完了までの移行率（予約系CV / セッション）比較チャート"""
+    """予約・電話アクション発生回数 / セッションの参考比率。"""
 
     def reservation_total(kev_dict):
         total = 0
@@ -456,7 +456,7 @@ def make_reservation_transition_rate_chart(
     ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f'{v:.1f}%'))
     ax.grid(True, axis='y', color=MPL_GRID, linewidth=0.8)
     _common_style(ax)
-    ax.set_title('予約完了までの移行率', fontsize=11, pad=8, color='#1E2B3A')
+    ax.set_title('予約・電話アクション / セッション（参考）', fontsize=11, pad=8, color='#1E2B3A')
 
     # 各棒の上に率、棒内に分母分子を表示（重なり回避）
     for i, b in enumerate(bars):

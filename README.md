@@ -4,7 +4,7 @@
 月次比較PDFを生成するStreamlitアプリ。
 
 **本番**: https://ga4-monthly-compare-report-v2.streamlit.app/
-**現行バージョン**: `2026-09-14-v5`
+**現行バージョン**: `2026-09-14-v6`
 
 ---
 
@@ -31,7 +31,7 @@
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt pytest pdfplumber
 
-.venv/bin/python -m pytest tests/ -q   # テスト45件
+.venv/bin/python -m pytest tests/ -q   # テスト52件
 .venv/bin/streamlit run app.py          # ローカル起動
 ```
 

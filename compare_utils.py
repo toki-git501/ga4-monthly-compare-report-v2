@@ -47,6 +47,9 @@ def calc_diff(current, previous) -> dict:
 
 def format_delta(diff_dict: dict) -> str:
     """"+1,234 (+12.3%) ▲" 形式の文字列を返す"""
+    if diff_dict.get('comparable') is False:
+        return '比較不能（未出力）'
+
     diff = diff_dict['diff']
     pct = diff_dict['pct']
     direction = diff_dict['direction']
@@ -88,7 +91,21 @@ def compare_kpis(cur_kpis: dict, prev_kpis: dict) -> dict:
     keys = ['active_users', 'new_users', 'sessions', 'avg_engage_sec', 'key_events_total']
     result = {}
     for k in keys:
-        result[k] = calc_diff(cur_kpis.get(k, 0), prev_kpis.get(k, 0))
+        diff = calc_diff(cur_kpis.get(k, 0), prev_kpis.get(k, 0))
+        if k == 'key_events_total':
+            cur_status = cur_kpis.get('key_events_status', 'missing')
+            prev_status = prev_kpis.get('key_events_status', 'missing')
+            comparable = cur_status != 'missing' and prev_status != 'missing'
+            diff.update({
+                'comparable': comparable,
+                'current_status': cur_status,
+                'previous_status': prev_status,
+            })
+            if not comparable:
+                diff['diff'] = 0.0
+                diff['pct'] = None
+                diff['direction'] = 'flat'
+        result[k] = diff
     return result
 
 
@@ -160,7 +177,7 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
         'active_users': 'アクティブユーザー',
         'new_users': '新規ユーザー',
         'sessions': 'セッション数',
-        'key_events_total': 'キーイベント合計',
+        'key_events_total': 'キーイベント発生回数',
     }
 
     # KPIで最も改善/悪化した指標
@@ -168,6 +185,8 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
     worst = None
     for k, label in kpi_labels.items():
         d = compared_kpis.get(k, {})
+        if d.get('comparable') is False:
+            continue
         pct = d.get('pct')
         if pct is None:
             continue
@@ -236,6 +255,8 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
     bullets = []
     for k, label in kpi_labels.items():
         d = compared_kpis.get(k, {})
+        if d.get('comparable') is False:
+            continue
         if d.get('direction') != 'flat':
             bullets.append(f"{label}: {format_delta(d)}")
     highlights['summary_bullets'] = bullets
@@ -260,9 +281,14 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
     eng = compared_kpis.get('avg_engage_sec', {})
     new_u = compared_kpis.get('new_users', {})
 
-    # CV（キーイベント）が当月・前月とも0 = 実質「未計測」。
-    # この場合、アクセス増減を成果（予約・電話）の良し悪しとして語れない。
-    cv_uncounted = (int(kev.get('current', 0)) == 0 and int(kev.get('previous', 0)) == 0)
+    # セクション未出力と、出力済み0件を区別する。
+    # 未出力を0件として比較すると、存在しない-100%減少を作ってしまう。
+    cv_missing = kev.get('comparable') is False
+    cv_zero = (
+        not cv_missing
+        and int(kev.get('current', 0)) == 0
+        and int(kev.get('previous', 0)) == 0
+    )
 
     def _pct(d):
         return abs(d.get('pct', 0) or 0)
@@ -282,13 +308,13 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
         else:
             facts_down.append(f"新規ユーザーが前月より {_pct(new_u):.1f}% 減りました。")
 
-    if not cv_uncounted and kev.get('pct') is not None and kev.get('diff', 0) != 0:
+    if not cv_missing and not cv_zero and kev.get('pct') is not None and kev.get('diff', 0) != 0:
         if kev.get('diff', 0) > 0:
-            headline_lines.append(f"キーイベント（予約・電話等）は前月比 {_pct(kev):.1f}% 増加")
-            facts_up.append(f"キーイベント（予約・電話等）が前月比 {_pct(kev):.1f}% 増えました。")
+            headline_lines.append(f"キーイベント発生回数は前月比 {_pct(kev):.1f}% 増加")
+            facts_up.append(f"キーイベント発生回数が前月比 {_pct(kev):.1f}% 増えました。")
         else:
-            headline_lines.append(f"キーイベント（予約・電話等）は前月比 {_pct(kev):.1f}% 減少")
-            facts_down.append(f"キーイベント（予約・電話等）が前月比 {_pct(kev):.1f}% 減りました。")
+            headline_lines.append(f"キーイベント発生回数は前月比 {_pct(kev):.1f}% 減少")
+            facts_down.append(f"キーイベント発生回数が前月比 {_pct(kev):.1f}% 減りました。")
 
     if eng.get('pct') is not None and eng.get('diff', 0) != 0:
         if eng.get('diff', 0) > 0:
@@ -296,21 +322,24 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
         else:
             facts_down.append(f"平均エンゲージメント時間が前月比 {_pct(eng):.1f}% 短くなりました。")
 
-    if cv_uncounted:
-        headline_lines.append('成果（予約・電話等）は未計測のため、アクセスの増減は参考値です')
-        facts_down.append(
-            'キーイベント（予約・電話等）が未計測のため、アクセスの増減が来院につながったかは判断できません。'
-        )
+    if cv_missing:
+        headline_lines.append('キーイベントデータが未出力のため、前月比較はできません')
+    elif cv_zero:
+        headline_lines.append('キーイベントは両月とも0件のため、成果の増減は判断できません')
 
     # ---- 次月の確認事項（根拠つき／原因は断定しない） ----
     # (priority, text) 。priority が大きいほど優先。
     scored_actions = []
 
-    if cv_uncounted:
+    if cv_missing:
+        scored_actions.append((210,
+            'GA4のレポートにキーイベント明細を追加して再出力する。CSVに明細が無いため、0件なのか未出力なのかを判定できず、前月比較は行っていない。'
+            '（根拠: キーイベントセクション未出力）'))
+    elif cv_zero:
         scored_actions.append((200,
             'GA4で予約ボタン・電話タップ・問い合わせ送信をキーイベントに設定し、成果を計測できる状態にする。'
             'これが無い限り、集客施策も広告も効果を評価できない。'
-            '（根拠: 当月・前月ともキーイベント0件）'))
+            '（根拠: 当月・前月ともキーイベント発生回数0件）'))
 
     # チャネルの変動: GA4のこのCSVでは「なぜ変わったか」は分からない。確認先を示す。
     top_ch = highlights.get('top_channel_change', {})
@@ -350,8 +379,8 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
             'この数字は流入量の変化を示すもので、原因はGA4のこのデータからは特定できません。'
         )
 
-    # セッションとキーイベントの組み合わせ（CVが計測されている場合のみ）
-    if not cv_uncounted:
+    # セッションとキーイベントの組み合わせ（両月で発生回数を比較できる場合のみ）
+    if not cv_missing and not cv_zero:
         ses_up = ses.get('diff', 0) > 0
         ses_down = ses.get('diff', 0) < 0
         kev_up = kev.get('diff', 0) > 0

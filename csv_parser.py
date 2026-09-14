@@ -44,8 +44,8 @@ def _to_numeric_series(series: pd.Series) -> pd.Series:
 
 
 # ─────────────────────────────────────────────────────
-# キーイベント（コンバージョン）集計ルール
-# 合計・比較表・グラフ・広告CV推計はすべて extract_cv_events() の結果を使う（単一ソース）
+# キーイベント発生回数の集計ルール
+# 合計・比較表・グラフはすべて extract_cv_events() の結果を使う（単一ソース）
 # ─────────────────────────────────────────────────────
 # GA4の自動収集・システム系イベント（患者の成果行動ではないため集計から除外）
 CV_EXCLUDE_EXACT = {
@@ -73,7 +73,7 @@ CV_DISPLAY_NAME_MAP = {
 
 
 def extract_cv_events(kev_dict: dict) -> dict:
-    """キーイベント辞書から患者コンバージョンのみを抽出する。
+    """キーイベント辞書から患者の重要アクションのみを抽出する。
 
     - tap/click 等のシステムイベント・求人系イベントを除外
     - 表示名へ変換し、件数降順の辞書を返す
@@ -181,6 +181,12 @@ def parse_ga4_csv(filepath_or_bytes) -> dict:
     df_kev_platform = None
     if df_kev is None:
         df_kev_platform = read_section(r'プラットフォーム,キーイベント$')
+    has_kev_header = bool(
+        re.search(r'^イベント名,キーイベント[ \t\r]*$', raw, re.MULTILINE)
+    )
+    has_kev_platform_header = bool(
+        re.search(r'^プラットフォーム,キーイベント[ \t\r]*$', raw, re.MULTILINE)
+    )
     df_trend  = read_section(r'N 日目,30 日,7 日,1 日')
     # 国別アクティブユーザー（国 ID 優先、無ければ 国）
     df_country = read_section(r'国 ID,アクティブ ユーザー$')
@@ -324,6 +330,7 @@ def parse_ga4_csv(filepath_or_bytes) -> dict:
         kpis['key_events_raw'] = kev_raw
         kpis['key_events'] = extract_cv_events(kev_raw)
         kpis['key_events_total'] = sum(kpis['key_events'].values())
+        kpis['key_events_status'] = 'available'
     elif df_kev_platform is not None:
         # イベント名の明細が無い場合はシステムイベントを除外できないため、
         # プラットフォーム合計をそのまま使う（過大の可能性あり・明細出力を推奨）
@@ -331,10 +338,19 @@ def parse_ga4_csv(filepath_or_bytes) -> dict:
         kpis['key_events_raw'] = {}
         kpis['key_events'] = {}
         kpis['key_events_total'] = int(kev_vals.sum())
+        kpis['key_events_status'] = 'fallback'
+    elif has_kev_header or has_kev_platform_header:
+        # ヘッダーがありデータ行が無い場合は「設定済み0件」として扱う。
+        # セクション自体が無い「未出力」と区別し、誤った前月比を防ぐ。
+        kpis['key_events_raw'] = {}
+        kpis['key_events'] = {}
+        kpis['key_events_total'] = 0
+        kpis['key_events_status'] = 'configured_zero'
     else:
         kpis['key_events_raw'] = {}
         kpis['key_events'] = {}
         kpis['key_events_total'] = 0
+        kpis['key_events_status'] = 'missing'
 
     return {
         'meta': meta,

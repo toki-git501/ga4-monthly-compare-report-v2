@@ -33,7 +33,7 @@ from csv_parser import parse_ga4_csv
 # 出力PDFに刻む生成バージョン。
 # デプロイが反映されたかを、出力物そのもので判定できるようにするため。
 # ロジックを変更したら必ず更新すること。
-REPORT_VERSION = '2026-09-14-v5'
+REPORT_VERSION = '2026-09-14-v6'
 from compare_utils import (
     calc_diff, format_delta, delta_color,
     compare_kpis, compare_dataframes, compare_key_events, compute_highlights,
@@ -496,16 +496,25 @@ class CompareReportCanvas:
                        f"前月{card_prev_values[i]}  {delta_str}",
                        font_size=7, color=clr, align='center')
 
-        # キーイベント合計バナー
+        # キーイベント発生回数バナー。未出力を0件として比較しない。
         banner_y = card_y - card_h - 6 * mm
         banner_w = PAGE_W - 24 * mm
         self._rect(12 * mm, banner_y - 12 * mm, banner_w, 12 * mm,
                    fill_color=COLOR_PRIMARY, radius=3)
         kev_diff = compared_kpis['key_events_total']
-        kev_delta = format_delta(kev_diff)
-        self._text(PAGE_W / 2, banner_y - 6 * mm,
-                   f"月間キーイベント合計:  {cur_kpis['key_events_total']:,} 件"
-                   f"（前月{prev_kpis['key_events_total']:,}  {kev_delta}）",
+        if kev_diff.get('comparable') is False:
+            cur_text = ('未出力' if cur_kpis.get('key_events_status') == 'missing'
+                        else f"{cur_kpis['key_events_total']:,}件")
+            prev_text = ('未出力' if prev_kpis.get('key_events_status') == 'missing'
+                         else f"{prev_kpis['key_events_total']:,}件")
+            banner_text = f'キーイベント発生回数: 当月 {cur_text} / 前月 {prev_text}（比較不能）'
+        else:
+            kev_delta = format_delta(kev_diff)
+            banner_text = (
+                f"キーイベント発生回数: {cur_kpis['key_events_total']:,}件 "
+                f"（前月{prev_kpis['key_events_total']:,}件 {kev_delta}）"
+            )
+        self._text(PAGE_W / 2, banner_y - 6 * mm, banner_text,
                    font_size=12, color=COLOR_WHITE, align='center')
 
         # 計測期間が不完全な場合の注記（前月比は参考値）
@@ -585,9 +594,9 @@ class CompareReportCanvas:
                                 cur_label, prev_label, company_name='',
                                 transition_rate_chart_bytes=None,
                                 cur_kpis=None, prev_kpis=None):
-        """P4: キーイベント（コンバージョン）比較 + 移行率"""
+        """P4: キーイベント発生回数とセッション比の比較。"""
         self._bg(COLOR_LIGHT)
-        self._page_title_bar('キーイベント（コンバージョン）比較')
+        self._page_title_bar('キーイベント発生回数比較')
 
         content_top = PAGE_H - 30 * mm
         margin = 10 * mm
@@ -597,10 +606,18 @@ class CompareReportCanvas:
             for i in compared_kevents
         )
 
-        # --- 上段: コンバージョン比較チャート（左）+ 移行率チャート（右） ---
+        cur_status = (cur_kpis or {}).get('key_events_status', 'missing')
+        prev_status = (prev_kpis or {}).get('key_events_status', 'missing')
+        comparison_available = cur_status != 'missing' and prev_status != 'missing'
+
+        # --- 上段: 発生回数比較（左）+ セッション比（右） ---
         chart_h = 58 * mm
         if kev_chart_bytes and transition_rate_chart_bytes:
-            self._section_header(margin, content_top, 'コンバージョン比較 / 予約完了までの移行率', '当月 vs 前月')
+            self._section_header(
+                margin, content_top,
+                'キーイベント発生回数 / 予約・電話アクションのセッション比（参考）',
+                '当月 vs 前月',
+            )
             left_w = 165 * mm
             right_w = PAGE_W - (margin * 2) - left_w - 6 * mm
             self._image_bytes(kev_chart_bytes, margin, content_top - 5 * mm,
@@ -609,28 +626,35 @@ class CompareReportCanvas:
                               margin + left_w + 6 * mm, content_top - 5 * mm,
                               right_w, h=chart_h)
         elif kev_chart_bytes:
-            self._section_header(margin, content_top, 'コンバージョン比較', '当月 vs 前月')
+            self._section_header(margin, content_top, 'キーイベント発生回数比較', '当月 vs 前月')
             self._image_bytes(kev_chart_bytes, margin, content_top - 5 * mm,
                               PAGE_W - 20 * mm, h=chart_h)
 
-        if not has_kev_data:
+        if not comparison_available:
+            cur_text = '未出力' if cur_status == 'missing' else '出力済み'
+            prev_text = '未出力' if prev_status == 'missing' else '出力済み'
             self._missing_data_notice(
                 margin + 2 * mm, content_top - 10 * mm, PAGE_W - 24 * mm, 10 * mm,
-                '計測データ未出力（キーイベント明細がCSVに含まれていません）'
+                f'キーイベント比較不能（当月: {cur_text} / 前月: {prev_text}）。未出力を0件として扱っていません。'
+            )
+        elif not has_kev_data:
+            self._missing_data_notice(
+                margin + 2 * mm, content_top - 10 * mm, PAGE_W - 24 * mm, 10 * mm,
+                'キーイベント発生回数は当月・前月とも0件です。'
             )
 
-        # --- 下段: キーイベントテーブル（CVR列付き） ---
+        # --- 下段: キーイベントテーブル（セッション比の参考値付き） ---
         if compared_kevents:
             table_y = content_top - 72 * mm
             cur_sessions = int(cur_kpis.get('sessions', 0)) if cur_kpis else 0
             prev_sessions = int(prev_kpis.get('sessions', 0)) if prev_kpis else 0
 
-            def cvr_str(cv, sessions):
+            def reference_rate_str(event_count, sessions):
                 if sessions > 0:
-                    return f'{cv / sessions * 100:.2f}%'
+                    return f'{event_count / sessions * 100:.2f}%'
                 return '-'
 
-            headers = ['イベント名', cur_label, prev_label, '増減', '増減率', '当月CVR', '前月CVR']
+            headers = ['イベント名', cur_label, prev_label, '増減', '増減率', '当月参考比率', '前月参考比率']
             rows = []
             reservation_keywords = ['予約', '電話', 'tel']
             res_cur_total = 0
@@ -645,25 +669,25 @@ class CompareReportCanvas:
                     f"{item['previous']:,}",
                     f"{sign}{int(d['diff']):,}",
                     pct_str,
-                    cvr_str(item['current'], cur_sessions),
-                    cvr_str(item['previous'], prev_sessions),
+                    reference_rate_str(item['current'], cur_sessions),
+                    reference_rate_str(item['previous'], prev_sessions),
                 ])
                 if any(kw in str(item['name']).lower() for kw in reservation_keywords):
                     res_cur_total += item['current']
                     res_prev_total += item['previous']
-            # 予約完了小計行
+            # クリック・電話タップ等であり、実際の予約成立とは限らないため「アクション」と表記する。
             if res_cur_total > 0 or res_prev_total > 0:
                 res_diff = calc_diff(res_cur_total, res_prev_total)
                 sign = '+' if res_diff['diff'] > 0 else ''
                 pct_str = f"{sign}{res_diff['pct']:.1f}%" if res_diff['pct'] is not None else 'N/A'
                 rows.append([
-                    '予約完了 小計',
+                    '予約・電話アクション 小計',
                     f"{res_cur_total:,}",
                     f"{res_prev_total:,}",
                     f"{sign}{int(res_diff['diff']):,}",
                     pct_str,
-                    cvr_str(res_cur_total, cur_sessions),
-                    cvr_str(res_prev_total, prev_sessions),
+                    reference_rate_str(res_cur_total, cur_sessions),
+                    reference_rate_str(res_prev_total, prev_sessions),
                 ])
             # 合計行
             total_cur = sum(i['current'] for i in compared_kevents)
@@ -677,18 +701,21 @@ class CompareReportCanvas:
                 f"{total_prev:,}",
                 f"{sign}{int(total_diff['diff']):,}",
                 pct_str,
-                cvr_str(total_cur, cur_sessions),
-                cvr_str(total_prev, prev_sessions),
+                reference_rate_str(total_cur, cur_sessions),
+                reference_rate_str(total_prev, prev_sessions),
             ])
 
             col_ws = [42 * mm, 22 * mm, 22 * mm, 22 * mm, 22 * mm, 20 * mm, 20 * mm]
             self._comparison_table(margin, table_y - 5 * mm, headers, rows, col_ws)
-            if not has_kev_data:
-                self._missing_data_notice(
-                    margin, table_y - (len(rows) + 1) * 7 * mm - 4 * mm,
-                    150 * mm, 9 * mm,
-                    '計測データ未出力: GA4エクスポートにキーイベント明細を追加してください'
-                )
+            note_y = table_y - (len(rows) + 1) * 7 * mm - 4 * mm
+            self._text_wrapped(
+                margin, note_y,
+                '※ 参考比率 = キーイベント発生回数 ÷ セッション数。GA4のセッションCVRではなく、同一セッション内の複数回発生を含みます。',
+                max_width=PAGE_W - 20 * mm,
+                font_size=6.3,
+                color=COLOR_GRAY,
+                max_lines=2,
+            )
 
         self._footer(company_name, 4)
 
@@ -1093,11 +1120,17 @@ class CompareReportCanvas:
             active_users = int(kpis.get('active_users', 0))
             new_users = int(kpis.get('new_users', 0))
             key_events_total = int(kpis.get('key_events_total', 0))
+            key_events_status = kpis.get('key_events_status', 'missing')
             avg_engage_sec = float(kpis.get('avg_engage_sec', 0))
 
+            key_event_comment = (
+                'キーイベント明細はCSVに未出力のため、発生回数は評価できません。'
+                if key_events_status == 'missing'
+                else f'予約・電話などのキーイベント発生回数は合計 {key_events_total:,} 件でした。'
+            )
             single_comments = [
                 f"今月のアクセス数は {sessions:,} 件、アクティブユーザーは {active_users:,} 人でした。",
-                f"新しく来訪したユーザーは {new_users:,} 人で、予約・電話などの成果は合計 {key_events_total:,} 件でした。",
+                f"新しく来訪したユーザーは {new_users:,} 人でした。{key_event_comment}",
                 f"1セッションあたりの平均エンゲージ時間は {avg_engage_sec:.1f} 秒でした。",
                 "次月は、成果につながったページの見出しと導線を優先的に整え、予約ボタン周辺の文言を統一して改善を進めることを推奨します。",
             ]
@@ -1341,15 +1374,19 @@ class CompareReportCanvas:
                                  compared_kevents,
                                  cur_kpis, prev_kpis, cur_label, prev_label, company_name='',
                                  page_num=9):
-        """P9: 予約完了分析"""
+        """予約・電話アクションの発生回数分析（現在は標準構成で未使用）。"""
         self._bg(COLOR_LIGHT)
-        self._page_title_bar('予約・電話 コンバージョン分析')
+        self._page_title_bar('予約・電話アクション分析')
 
         content_top = PAGE_H - 30 * mm
         margin = 10 * mm
 
         # 予約比較チャート（左）＋移行率チャート（右）
-        self._section_header(margin, content_top, '予約・電話CV比較 / 予約完了までの移行率', '当月 vs 前月')
+        self._section_header(
+            margin, content_top,
+            '予約・電話アクション発生回数 / セッション比（参考）',
+            '当月 vs 前月',
+        )
         chart_y = content_top - 5 * mm
         left_w = 165 * mm
         right_w = PAGE_W - (margin * 2) - left_w - 6 * mm
@@ -1568,11 +1605,25 @@ class CompareReportCanvas:
 
         # 注意書き
         note_y = table_top - 5 * mm - (len(rows) + 1) * 7 * mm - 3 * mm
-        cv_uncounted = (cur_total_cv == 0 and prev_total_cv == 0)
-        if cv_uncounted:
+        key_events_missing = (
+            cur_kpis.get('key_events_status') == 'missing'
+            or prev_kpis.get('key_events_status') == 'missing'
+        )
+        key_events_zero = (
+            not key_events_missing and cur_total_cv == 0 and prev_total_cv == 0
+        )
+        if key_events_missing:
             used = self._text_wrapped(
                 margin, note_y,
-                '⚠ キーイベント（予約・電話等）自体が未計測です。まずGA4でキーイベントを設定してください。',
+                '⚠ キーイベント明細がCSVに未出力です。0件とは判定せず、発生回数の比較を行っていません。',
+                max_width=PAGE_W - margin * 2,
+                font_size=6.5, color=colors.HexColor('#B5791F'), max_lines=2,
+            )
+            note_y -= max(used, 1) * 4.5 * mm
+        elif key_events_zero:
+            used = self._text_wrapped(
+                margin, note_y,
+                '⚠ キーイベント明細は出力されていますが、当月・前月とも発生回数は0件です。',
                 max_width=PAGE_W - margin * 2,
                 font_size=6.5, color=colors.HexColor('#B5791F'), max_lines=2,
             )
@@ -1605,8 +1656,8 @@ class CompareReportCanvas:
              'ユーザーの訪問から離脱までの一連の行動。30分以上操作がないと新規セッション扱い。'),
             ('エンゲージメント時間',
              'ユーザーがサイトをアクティブに利用していた時間。タブがフォアグラウンドの間のみ計測。'),
-            ('キーイベント（CV）',
-             'ビジネス目標達成に重要な行動（WEB予約・電話タップ等）。GA4でキーイベント設定された発生回数。'),
+            ('キーイベント',
+             'WEB予約クリック・電話タップ等、GA4で重要と設定した行動の発生回数。実際の予約成立件数やセッションCVRとは異なる。'),
             ('チャネル',
              '流入経路の分類。オーガニック検索/ダイレクト/有料検索/参照元/オーガニックSNS等。'),
             ('表示回数（PV）',
@@ -1659,12 +1710,13 @@ class CompareReportCanvas:
         if incomplete_note:
             notes.append('• ' + incomplete_note.lstrip('※ ').strip())
 
-        ny = note_top - 9 * mm
+        # 国別注記が2行になっても、生成バージョンまでフッターより上に収める。
+        ny = note_top - 7 * mm
         for note in notes:
             used = self._text_wrapped(margin + 5 * mm, ny, note,
                                       max_width=PAGE_W - margin - 5 * mm - 12 * mm,
                                       font_size=6.5, color=COLOR_DARK, max_lines=3)
-            ny -= max(used, 1) * 5.2 * mm
+            ny -= max(used, 1) * 4.2 * mm
 
         self._footer(company_name, page_num)
 
@@ -1704,10 +1756,14 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
         cur_data['df_ch_ses'].columns[1] if cur_data['df_ch_ses'] is not None else 'value',
     ) if cur_data['df_ch_ses'] is not None or prev_data['df_ch_ses'] is not None else pd.DataFrame()
 
+    key_events_comparable = (
+        cur_kpis.get('key_events_status') != 'missing'
+        and prev_kpis.get('key_events_status') != 'missing'
+    )
     compared_kevents = compare_key_events(
         cur_kpis.get('key_events', {}),
         prev_kpis.get('key_events', {}),
-    )
+    ) if key_events_comparable else []
 
     # 3. チャート生成
     daily_chart = make_daily_overlay_chart(
@@ -1718,7 +1774,7 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
 
     kev_chart = make_key_events_grouped_bar(
         cur_kpis.get('key_events', {}), prev_kpis.get('key_events', {}),
-        cur_label, prev_label)
+        cur_label, prev_label) if key_events_comparable else None
 
     pages_chart = make_top_pages_compare_chart(
         cur_data['df_pages'], prev_data['df_pages'])
@@ -1745,7 +1801,7 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
         int(prev_kpis.get('sessions', 0)),
         cur_label,
         prev_label,
-    )
+    ) if key_events_comparable else None
     paid_channel_chart = make_paid_channels_grouped_bar(
         cur_data.get('df_ch_ses'),
         prev_data.get('df_ch_ses'),
