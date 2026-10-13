@@ -6,3 +6,5 @@ matplotlib
 reportlab
 pillow
 setuptools
+
+# restart marker v8 (2026-10-13): force full process restart on Streamlit Cloud
