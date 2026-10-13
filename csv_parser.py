@@ -54,8 +54,13 @@ CV_EXCLUDE_EXACT = {
     'video_start', 'video_progress', 'video_complete',
     'form_start', 'view_promotion', 'select_promotion',
 }
-# 患者コンバージョンから除外する名称パターン（採用・求人系）
-CV_EXCLUDE_PATTERNS = ('求人', '採用', 'recruit', 'saiyo')
+# 求人関連イベントの名称パターン。
+# v8〜: 計測対象に含めるが、予約・電話等の患者アクションとは別カテゴリ
+# （key_events_recruit）として集計し、予約・電話アクションの合計・参考比率には混ぜない。
+# 「まいなびリンク_top」等の求人サイトへのリンクも求人関連として扱う。
+CV_RECRUIT_PATTERNS = ('求人', '採用', 'recruit', 'saiyo', 'まいなび', 'マイナビ', 'mynavi')
+# 互換用の別名（v7まではこのパターンを患者コンバージョンから除外していた）
+CV_EXCLUDE_PATTERNS = CV_RECRUIT_PATTERNS
 
 # 既知イベントの表示名（未知のイベントは元の名称のまま表示する）
 CV_DISPLAY_NAME_MAP = {
@@ -72,20 +77,36 @@ CV_DISPLAY_NAME_MAP = {
 }
 
 
-def extract_cv_events(kev_dict: dict) -> dict:
-    """キーイベント辞書から患者の重要アクションのみを抽出する。
+# キーイベント状態: GA4のキーイベント明細が無く、イベント名から候補を判定したもの
+KEY_EVENTS_INFERRED = 'event_name_inferred'
+KEY_EVENTS_INFERRED_NOTE = 'GA4のキーイベント設定は出力に含まれないため、イベント名から判定'
 
-    - tap/click 等のシステムイベント・求人系イベントを除外
-    - 表示名へ変換し、件数降順の辞書を返す
-    - 当月・前月とも同一ルールで抽出するため、比較の整合が保証される
+
+def _is_event_inference_source(title: str) -> bool:
+    """イベント名からの判定に使ってよい出力元レポートか。"""
+    t = (title or '').strip()
+    return t == 'エンゲージメントの概要' or t.startswith('イベント')
+
+
+def is_recruit_event(name) -> bool:
+    """求人関連イベント（求人応募ボタン・求人サイトへのリンク等）か。"""
+    low = str(name).strip().lower()
+    return any(p in low for p in CV_RECRUIT_PATTERNS)
+
+
+def classify_key_events(kev_dict: dict) -> tuple:
+    """キーイベント辞書を (患者アクション, 求人関連) の2カテゴリに分ける。
+
+    - tap/click 等のGA4自動計測・システムイベントはどちらにも入れない（除外）
+    - 求人関連は計測対象だが、予約・電話等の合計に混ぜないため別の辞書で返す
+    - 表示名へ変換し、それぞれ件数降順の辞書を返す
+    - 当月・前月とも同一ルールで分類するため、比較の整合が保証される
     """
-    merged = {}
+    patient, recruit = {}, {}
     for name, count in (kev_dict or {}).items():
         raw_name = str(name).strip()
         low = raw_name.lower()
         if low in CV_EXCLUDE_EXACT:
-            continue
-        if any(p in low for p in CV_EXCLUDE_PATTERNS):
             continue
         try:
             n = int(count)
@@ -93,9 +114,28 @@ def extract_cv_events(kev_dict: dict) -> dict:
             continue
         if n <= 0:
             continue
+        target = recruit if is_recruit_event(raw_name) else patient
         display = CV_DISPLAY_NAME_MAP.get(low, raw_name)
-        merged[display] = merged.get(display, 0) + n
-    return dict(sorted(merged.items(), key=lambda x: (-x[1], x[0])))
+        target[display] = target.get(display, 0) + n
+
+    def _sorted(d):
+        return dict(sorted(d.items(), key=lambda x: (-x[1], x[0])))
+    return _sorted(patient), _sorted(recruit)
+
+
+def extract_cv_events(kev_dict: dict) -> dict:
+    """キーイベント辞書から患者の重要アクション（予約・電話等）のみを抽出する。
+
+    - tap/click 等のシステムイベントを除外
+    - 求人関連は別カテゴリのため含めない（extract_recruit_events() で取得）
+    - 表示名へ変換し、件数降順の辞書を返す
+    """
+    return classify_key_events(kev_dict)[0]
+
+
+def extract_recruit_events(kev_dict: dict) -> dict:
+    """キーイベント辞書から求人関連イベントのみを抽出する（件数降順）。"""
+    return classify_key_events(kev_dict)[1]
 
 
 def parse_ga4_csv(filepath_or_bytes) -> dict:
@@ -135,13 +175,39 @@ def parse_ga4_csv(filepath_or_bytes) -> dict:
     else:
         meta['month_label'] = ''
 
-    def read_section(header_pattern: str):
-        """指定ヘッダ行以降のCSVブロックを読み込む"""
-        lines = raw.splitlines()
+    lines = raw.splitlines()
+
+    # 複数CSVを結合した入力（csv_merge.merge_ga4_csvs）では、各ファイル冒頭の
+    # 「# ----」直後の行に出力元レポート名がある。セクションがどのレポート由来かを
+    # 判定するため、レポート名の出現位置を控えておく。
+    report_titles = []
+    for i in range(len(lines) - 1):
+        if re.match(r'^#\s*-{5,}\s*$', lines[i].strip()):
+            m = re.match(r'^#\s*(.+?)\s*$', lines[i + 1].strip())
+            if m and not re.match(r'^(アカウント|プロパティ)\s*:', m.group(1)) \
+                    and not re.match(r'^-{5,}$', m.group(1)):
+                report_titles.append((i + 1, m.group(1)))
+
+    def section_source(line_index: int) -> str:
+        title = ''
+        for idx, name in report_titles:
+            if idx < line_index:
+                title = name
+            else:
+                break
+        return title
+
+    def read_section(header_pattern: str, accept=None):
+        """指定ヘッダ行以降のCSVブロックを読み込む。
+
+        accept: ヘッダ行の行番号を受け取り、採用するかを返す関数（省略時は最初の一致）
+        """
         start_i = None
         col_names = None
         for i, line in enumerate(lines):
             if re.search(header_pattern, line.strip()):
+                if accept is not None and not accept(i):
+                    continue
                 col_names = [c.strip() for c in line.strip().split(',')]
                 start_i = i + 1
                 break
@@ -187,6 +253,15 @@ def parse_ga4_csv(filepath_or_bytes) -> dict:
     has_kev_platform_header = bool(
         re.search(r'^プラットフォーム,キーイベント[ \t\r]*$', raw, re.MULTILINE)
     )
+    # キーイベントのイベント別内訳が無い場合に限り、イベント名から候補を判定する。
+    # 判定元は「エンゲージメントの概要」または「イベント」レポート由来の
+    # 「イベント名,イベント数」に限る（従来のスナップショット単体の挙動は変えない）。
+    df_events_for_inference = None
+    if not has_kev_header:
+        df_events_for_inference = read_section(
+            r'^イベント名,イベント数',
+            accept=lambda i: _is_event_inference_source(section_source(i)),
+        )
     df_trend  = read_section(r'N 日目,30 日,7 日,1 日')
     # 国別アクティブユーザー（国 ID 優先、無ければ 国）
     df_country = read_section(r'国 ID,アクティブ ユーザー$')
@@ -319,18 +394,33 @@ def parse_ga4_csv(filepath_or_bytes) -> dict:
         kpis['avg_engage_sec'] = 0
         kpis['avg_engage_str'] = '-'
 
-    # キーイベント（患者コンバージョンのみ）
+    # キーイベント（患者アクション＝key_events / 求人関連＝key_events_recruit）
     # 旧実装は tap 等のシステムイベント・求人系まで合算しており過大だったため、
-    # extract_cv_events() で除外・表示名統一した結果を全ページの単一ソースとする。
+    # classify_key_events() で除外・分類・表示名統一した結果を全ページの単一ソースとする。
+    # key_events_total は患者アクション（予約・電話等）のみの合計（求人関連は含めない）。
     if df_kev is not None:
         kev_raw = {}
         for _, row in df_kev.iterrows():
             value = _to_numeric_series(pd.Series([row.iloc[1]])).iloc[0]
             kev_raw[str(row.iloc[0])] = int(value) if pd.notna(value) else 0
         kpis['key_events_raw'] = kev_raw
-        kpis['key_events'] = extract_cv_events(kev_raw)
+        kpis['key_events'], kpis['key_events_recruit'] = classify_key_events(kev_raw)
         kpis['key_events_total'] = sum(kpis['key_events'].values())
         kpis['key_events_status'] = 'available'
+    elif df_events_for_inference is not None:
+        # GA4のキーイベント設定（どのイベントがキーイベントか）は出力に含まれないため、
+        # イベント名から extract_cv_events() と同じ除外規則で候補を判定する。
+        # GA4のキーイベント明細（available）とは集計方法が異なるため、別状態として扱い、
+        # available との前月比較は行わない（compare_utils.key_events_comparison）。
+        ev_raw = {}
+        for _, row in df_events_for_inference.iterrows():
+            value = _to_numeric_series(pd.Series([row.iloc[1]])).iloc[0]
+            name = str(row.iloc[0]).strip()
+            ev_raw[name] = ev_raw.get(name, 0) + (int(value) if pd.notna(value) else 0)
+        kpis['key_events_raw'] = ev_raw
+        kpis['key_events'], kpis['key_events_recruit'] = classify_key_events(ev_raw)
+        kpis['key_events_total'] = sum(kpis['key_events'].values())
+        kpis['key_events_status'] = KEY_EVENTS_INFERRED
     elif df_kev_platform is not None:
         # イベント名の明細が無い場合はシステムイベントを除外できないため、
         # プラットフォーム合計をそのまま使う（過大の可能性あり・明細出力を推奨）
@@ -351,6 +441,11 @@ def parse_ga4_csv(filepath_or_bytes) -> dict:
         kpis['key_events'] = {}
         kpis['key_events_total'] = 0
         kpis['key_events_status'] = 'missing'
+
+    # 求人関連イベント（別カテゴリ）。key_events_total には含めない。
+    # 予約・電話アクションの合計と参考比率（÷セッション数）に求人応募を混ぜないため。
+    kpis.setdefault('key_events_recruit', {})
+    kpis['key_events_recruit_total'] = sum(kpis['key_events_recruit'].values())
 
     return {
         'meta': meta,

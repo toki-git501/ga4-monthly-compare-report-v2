@@ -131,43 +131,77 @@ def make_channel_grouped_bar(cur_ch_ses, prev_ch_ses, cur_label: str, prev_label
     return fig_to_bytes(fig)
 
 
+KEY_EVENTS_CHART_TOP_N = 7   # グラフに個別表示するイベント数（超過分は「その他」1本に集約）
+KEY_EVENTS_LABEL_MAX = 14    # イベント名ラベルの最大文字数（超過は「…」で省略）
+
+
+def key_events_chart_items(cur_kev, prev_kev, top_n: int = KEY_EVENTS_CHART_TOP_N) -> list:
+    """グラフに描く (ラベル, 当月, 前月) のリスト（上から大きい順）。
+
+    max(当月, 前月) の降順で上位 top_n 件を個別に、残りは「その他（N種）」1本に集約する。
+    合計値は全件で保たれる（その他に入れた分も消さない）。
+    """
+    keys = set(cur_kev or {}) | set(prev_kev or {})
+    rows = [(k, int((cur_kev or {}).get(k, 0)), int((prev_kev or {}).get(k, 0))) for k in keys]
+    rows.sort(key=lambda r: (-max(r[1], r[2]), -r[1], str(r[0])))
+    if len(rows) > top_n + 1:
+        rest = rows[top_n:]
+        rows = rows[:top_n] + [(f'その他（{len(rest)}種）',
+                                sum(r[1] for r in rest), sum(r[2] for r in rest))]
+
+    def short(name):
+        name = str(name)
+        return name if len(name) <= KEY_EVENTS_LABEL_MAX else name[:KEY_EVENTS_LABEL_MAX - 1] + '…'
+    return [(short(k), c, p) for k, c, p in rows]
+
+
 def make_key_events_grouped_bar(cur_kev, prev_kev, cur_label: str, prev_label: str,
-                                width_inch=8, height_inch=3.5) -> bytes:
-    """キーイベント比較縦棒グラフ"""
-    all_keys = sorted(set(list(cur_kev.keys()) + list(prev_kev.keys())))
-    if not all_keys:
+                                width_inch=8, height_inch=2.9,
+                                title: str = 'キーイベント発生回数比較') -> bytes:
+    """キーイベント比較の横棒グラフ。
+
+    縦棒＋横軸ラベルだと、イベント名判定でイベント数が多い月にラベルが重なっていた。
+    イベント名を縦軸に置く横棒にし、上位N件＋「その他」に集約して重なりを防ぐ。
+    """
+    items = key_events_chart_items(cur_kev, prev_kev)
+    if not items:
         return None
 
-    cur_vals = [cur_kev.get(k, 0) for k in all_keys]
-    prev_vals = [prev_kev.get(k, 0) for k in all_keys]
+    labels = [i[0] for i in items][::-1]   # 上から大きい順に見せるため反転
+    cur_vals = [i[1] for i in items][::-1]
+    prev_vals = [i[2] for i in items][::-1]
 
     fig, ax = plt.subplots(figsize=(width_inch, height_inch), facecolor='white')
     ax.set_facecolor('white')
 
-    x = np.arange(len(all_keys))
-    bar_w = 0.35
+    y = np.arange(len(labels))
+    bar_h = 0.38
 
-    ax.bar(x - bar_w / 2, cur_vals, bar_w, label=cur_label, color=MPL_PRIMARY, edgecolor='none')
-    ax.bar(x + bar_w / 2, prev_vals, bar_w, label=prev_label, color=MPL_PREV, edgecolor='none')
+    ax.barh(y + bar_h / 2, cur_vals, bar_h, label=cur_label, color=MPL_PRIMARY, edgecolor='none')
+    ax.barh(y - bar_h / 2, prev_vals, bar_h, label=prev_label, color=MPL_PREV, edgecolor='none')
 
-    # 値ラベル
+    max_val = max(max(cur_vals, default=0), max(prev_vals, default=0))
+    pad = max_val * 0.01 if max_val > 0 else 0.05
+    # 値ラベル（棒の右端）
     for i, (cv, pv) in enumerate(zip(cur_vals, prev_vals)):
         if cv > 0:
-            ax.text(i - bar_w / 2, cv + 0.3, f'{cv:,}', ha='center', va='bottom',
-                    fontsize=8, color=MPL_PRIMARY, fontweight='bold')
+            ax.text(cv + pad, i + bar_h / 2, f'{cv:,}', ha='left', va='center',
+                    fontsize=7, color=MPL_PRIMARY, fontweight='bold')
         if pv > 0:
-            ax.text(i + bar_w / 2, pv + 0.3, f'{pv:,}', ha='center', va='bottom',
-                    fontsize=8, color='#6B8EAD')
+            ax.text(pv + pad, i - bar_h / 2, f'{pv:,}', ha='left', va='center',
+                    fontsize=7, color='#6B8EAD')
 
-    ax.set_xticks(x)
-    ax.set_xticklabels(all_keys, fontsize=8, rotation=15)
-    max_val = max(max(cur_vals, default=0), max(prev_vals, default=0))
-    ax.set_ylim(0, max_val * 1.3 if max_val > 0 else 1)
-    ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f'{int(x):,}'))
-    ax.grid(True, axis='y', color=MPL_GRID, linewidth=0.8)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.set_ylim(-0.6, len(labels) - 0.4)
+    ax.set_xlim(0, max_val * 1.18 if max_val > 0 else 1)
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f'{int(x):,}'))
+    ax.grid(True, axis='x', color=MPL_GRID, linewidth=0.8)
     _common_style(ax)
-    ax.legend(fontsize=9, framealpha=0, loc='upper right')
-    ax.set_title('キーイベント発生回数比較', fontsize=11, pad=8, color='#1E2B3A')
+    # 凡例は棒と重ならないよう軸の外（右上）、タイトルは左寄せにして凡例と離す
+    ax.legend(fontsize=8, framealpha=0, loc='lower right', bbox_to_anchor=(1.0, 1.0),
+              ncol=2, borderaxespad=0.2)
+    ax.set_title(title, fontsize=11, pad=8, color='#1E2B3A', loc='left')
     fig.tight_layout()
     return fig_to_bytes(fig)
 

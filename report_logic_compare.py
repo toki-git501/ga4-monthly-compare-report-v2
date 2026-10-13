@@ -28,16 +28,16 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 from PIL import Image as PILImage
 
-from csv_parser import parse_ga4_csv
+from csv_parser import parse_ga4_csv, KEY_EVENTS_INFERRED, KEY_EVENTS_INFERRED_NOTE
 
 # 出力PDFに刻む生成バージョン。
 # デプロイが反映されたかを、出力物そのもので判定できるようにするため。
 # ロジックを変更したら必ず更新すること。
-REPORT_VERSION = '2026-09-14-v6'
+REPORT_VERSION = '2026-10-13-v8'
 from compare_utils import (
     calc_diff, format_delta, delta_color,
     compare_kpis, compare_dataframes, compare_key_events, compute_highlights,
-    select_top_pages,
+    select_top_pages, key_events_comparison,
 )
 from chart_generator_compare import (
     make_daily_overlay_chart, make_channel_grouped_bar,
@@ -177,6 +177,58 @@ def incomplete_note_text(cur_meta: dict, prev_meta: dict,
             f'当月（{cur_label}）は月初〜{untracked}日目が未計測の可能性があり、数値が過小になる場合があります。'
         )
     return '　'.join(notes)
+
+
+def key_events_status_text(kpis: dict) -> str:
+    """キーイベント発生回数の表示文字列。未出力は0件と書かない。"""
+    kpis = kpis or {}
+    status = kpis.get('key_events_status', 'missing')
+    if status == 'missing':
+        return '未出力'
+    total = int(kpis.get('key_events_total', 0))
+    if status == KEY_EVENTS_INFERRED:
+        return f'{total:,}件（イベント名から判定）'
+    return f'{total:,}件'
+
+
+def key_events_inferred_note(cur_kpis: dict, prev_kpis: dict) -> str:
+    """イベント名から判定した月がある場合の注記（無ければ空文字）。"""
+    cur_inf = (cur_kpis or {}).get('key_events_status') == KEY_EVENTS_INFERRED
+    prev_inf = (prev_kpis or {}).get('key_events_status') == KEY_EVENTS_INFERRED
+    if not (cur_inf or prev_inf):
+        return ''
+    if cur_inf and prev_inf:
+        scope = ''
+    elif cur_inf:
+        scope = '当月は'
+    else:
+        scope = '前月は'
+    return (f'※ キーイベント: {scope}{KEY_EVENTS_INFERRED_NOTE}'
+            '（tap・click等の自動計測は除外。求人関連は予約・電話等と分けて別集計）。')
+
+
+def has_recruit_events(*kpis_list) -> bool:
+    """いずれかの月に求人関連イベントがあるか。"""
+    return any(int((k or {}).get('key_events_recruit_total', 0)) > 0 for k in kpis_list)
+
+
+def recruit_events_note(cur_kpis: dict, prev_kpis: dict) -> str:
+    """KPIサマリ（P2）用: 求人関連イベントを別集計したことの注記（無ければ空文字）。
+
+    求人関連は計測対象だが、予約・電話アクションの合計（バナーの値）には含めない。
+    """
+    if not has_recruit_events(cur_kpis, prev_kpis):
+        return ''
+    cur_t = int((cur_kpis or {}).get('key_events_recruit_total', 0))
+    prev_t = int((prev_kpis or {}).get('key_events_recruit_total', 0))
+    comparable, _ = key_events_comparison(
+        (cur_kpis or {}).get('key_events_status'), (prev_kpis or {}).get('key_events_status'))
+    if comparable:
+        delta = format_delta(calc_diff(cur_t, prev_t))
+        counts = f'当月 {cur_t:,}件 / 前月 {prev_t:,}件（{delta}）'
+    else:
+        counts = f'当月 {cur_t:,}件 / 前月 {prev_t:,}件（比較不能）'
+    return f'※ 求人関連のイベント（求人応募ボタン・求人サイトへのリンク等）は上記に含めず別集計: {counts}'
 
 
 class CompareReportCanvas:
@@ -503,15 +555,18 @@ class CompareReportCanvas:
                    fill_color=COLOR_PRIMARY, radius=3)
         kev_diff = compared_kpis['key_events_total']
         if kev_diff.get('comparable') is False:
-            cur_text = ('未出力' if cur_kpis.get('key_events_status') == 'missing'
-                        else f"{cur_kpis['key_events_total']:,}件")
-            prev_text = ('未出力' if prev_kpis.get('key_events_status') == 'missing'
-                         else f"{prev_kpis['key_events_total']:,}件")
-            banner_text = f'キーイベント発生回数: 当月 {cur_text} / 前月 {prev_text}（比較不能）'
+            cur_text = key_events_status_text(cur_kpis)
+            prev_text = key_events_status_text(prev_kpis)
+            reason = ('集計方法が異なるため比較不能'
+                      if kev_diff.get('incomparable_reason') == 'method_mismatch' else '比較不能')
+            banner_text = f'キーイベント発生回数: 当月 {cur_text} / 前月 {prev_text}（{reason}）'
         else:
             kev_delta = format_delta(kev_diff)
+            kev_label = ('キーイベント発生回数（イベント名から判定）'
+                         if cur_kpis.get('key_events_status') == KEY_EVENTS_INFERRED
+                         else 'キーイベント発生回数')
             banner_text = (
-                f"キーイベント発生回数: {cur_kpis['key_events_total']:,}件 "
+                f"{kev_label}: {cur_kpis['key_events_total']:,}件 "
                 f"（前月{prev_kpis['key_events_total']:,}件 {kev_delta}）"
             )
         self._text(PAGE_W / 2, banner_y - 6 * mm, banner_text,
@@ -519,7 +574,22 @@ class CompareReportCanvas:
 
         # 計測期間が不完全な場合の注記（前月比は参考値）
         chart_offset = 0
-        note_y = banner_y - 13 * mm
+        # 1行目の注記はバナー下端（banner_y - 12mm）から文字高さ分離す。
+        # -13mm だと文字の上端がバナーに隠れていた。
+        note_y = banner_y - 15 * mm
+        inferred_note = key_events_inferred_note(cur_kpis, prev_kpis)
+        if inferred_note:
+            self._text(12 * mm, note_y, inferred_note, font_size=7, color=COLOR_GRAY)
+            chart_offset += 5 * mm
+            note_y -= 4 * mm
+        # 求人関連は計測するが、バナーの合計（予約・電話等）には混ぜず別集計で示す
+        recruit_note = recruit_events_note(cur_kpis, prev_kpis)
+        if recruit_note:
+            used = self._text_wrapped(12 * mm, note_y, recruit_note,
+                                      max_width=PAGE_W - 24 * mm,
+                                      font_size=7, color=COLOR_GRAY, max_lines=2)
+            chart_offset += max(used, 1) * 4 * mm + 1 * mm
+            note_y -= max(used, 1) * 4 * mm
         if incomplete_note:
             self._text(12 * mm, note_y, f'⚠ {incomplete_note}',
                        font_size=7, color=colors.HexColor('#B5791F'))
@@ -533,6 +603,8 @@ class CompareReportCanvas:
                                       max_width=PAGE_W - 24 * mm,
                                       font_size=7, color=COLOR_GRAY, max_lines=2)
             chart_offset += max(used, 1) * 4 * mm
+        if chart_offset:
+            chart_offset += 2 * mm  # 注記の開始位置を下げた分
 
         # 日別ユーザー推移グラフ（バナーの下、フッターの上に画面いっぱい）
         if daily_chart_bytes:
@@ -593,8 +665,13 @@ class CompareReportCanvas:
     def draw_key_events_compare(self, kev_chart_bytes, compared_kevents,
                                 cur_label, prev_label, company_name='',
                                 transition_rate_chart_bytes=None,
-                                cur_kpis=None, prev_kpis=None):
-        """P4: キーイベント発生回数とセッション比の比較。"""
+                                cur_kpis=None, prev_kpis=None,
+                                compared_recruit=None):
+        """P4: キーイベント発生回数とセッション比の比較。
+
+        compared_recruit: 求人関連イベントの比較結果（compare_key_events の形式）。
+            予約・電話等の表とは分けて右側に別表（求人関連 小計つき）で示す。
+        """
         self._bg(COLOR_LIGHT)
         self._page_title_bar('キーイベント発生回数比較')
 
@@ -608,7 +685,14 @@ class CompareReportCanvas:
 
         cur_status = (cur_kpis or {}).get('key_events_status', 'missing')
         prev_status = (prev_kpis or {}).get('key_events_status', 'missing')
-        comparison_available = cur_status != 'missing' and prev_status != 'missing'
+        comparison_available, incomparable_reason = key_events_comparison(cur_status, prev_status)
+
+        def status_label(status):
+            if status == 'missing':
+                return '未出力'
+            if status == KEY_EVENTS_INFERRED:
+                return 'イベント名から判定'
+            return 'GA4のキーイベント明細'
 
         # --- 上段: 発生回数比較（左）+ セッション比（右） ---
         chart_h = 58 * mm
@@ -630,7 +714,13 @@ class CompareReportCanvas:
             self._image_bytes(kev_chart_bytes, margin, content_top - 5 * mm,
                               PAGE_W - 20 * mm, h=chart_h)
 
-        if not comparison_available:
+        if not comparison_available and incomparable_reason == 'method_mismatch':
+            self._missing_data_notice(
+                margin + 2 * mm, content_top - 10 * mm, PAGE_W - 24 * mm, 10 * mm,
+                f'キーイベント比較不能（当月: {status_label(cur_status)} / 前月: {status_label(prev_status)}）。'
+                '集計方法が異なるため、増減を比較していません。'
+            )
+        elif not comparison_available:
             cur_text = '未出力' if cur_status == 'missing' else '出力済み'
             prev_text = '未出力' if prev_status == 'missing' else '出力済み'
             self._missing_data_notice(
@@ -660,23 +750,58 @@ class CompareReportCanvas:
             res_cur_total = 0
             res_prev_total = 0
             for item in compared_kevents:
-                d = item['diff_dict']
-                sign = '+' if d['diff'] > 0 else ''
-                pct_str = f"{sign}{d['pct']:.1f}%" if d['pct'] is not None else 'N/A'
-                rows.append([
-                    str(item['name'])[:20],
-                    f"{item['current']:,}",
-                    f"{item['previous']:,}",
-                    f"{sign}{int(d['diff']):,}",
-                    pct_str,
-                    reference_rate_str(item['current'], cur_sessions),
-                    reference_rate_str(item['previous'], prev_sessions),
-                ])
                 if any(kw in str(item['name']).lower() for kw in reservation_keywords):
                     res_cur_total += item['current']
                     res_prev_total += item['previous']
+            has_res_row = res_cur_total > 0 or res_prev_total > 0
+
+            # イベント名から判定した月はイベント数が多くなりやすい。表がフッターに
+            # 食い込まないよう、収まらない分は「その他」1行にまとめる（合計値は全件で計算）。
+            # 求人関連の別表を右に置く場合、注記は左表の幅に収めて別表と重ねない。
+            col_ws = [42 * mm, 22 * mm, 22 * mm, 22 * mm, 22 * mm, 20 * mm, 20 * mm]
+            note_w = sum(col_ws) if compared_recruit else PAGE_W - 20 * mm
+            table_notes = [
+                '※ 参考比率 = キーイベント発生回数 ÷ セッション数。GA4のセッションCVRではなく、同一セッション内の複数回発生を含みます。'
+            ]
+            inferred_note = key_events_inferred_note(cur_kpis, prev_kpis)
+            if inferred_note:
+                table_notes.append(inferred_note)
+            note_line_counts = [max(len(self._wrap_lines(n, note_w, 6.3, max_lines=2)), 1)
+                                for n in table_notes]
+            note_lines = sum(note_line_counts)
+            bottom_limit = 11 * mm + note_lines * 4 * mm + 4 * mm
+            max_rows = int((table_y - 5 * mm - bottom_limit) // (7 * mm)) - 1  # 見出し行を除く
+            fixed_rows = 1 + (1 if has_res_row else 0)  # 合計 + 小計
+            max_event_rows = max(1, max_rows - fixed_rows)
+            shown = list(compared_kevents)
+            folded = []
+            if len(shown) > max_event_rows:
+                shown, folded = shown[:max_event_rows - 1], shown[max_event_rows - 1:]
+
+            def event_row(name, cur_v, prev_v):
+                d = calc_diff(cur_v, prev_v)
+                sign = '+' if d['diff'] > 0 else ''
+                pct_str = f"{sign}{d['pct']:.1f}%" if d['pct'] is not None else 'N/A'
+                return [
+                    name,
+                    f"{int(cur_v):,}",
+                    f"{int(prev_v):,}",
+                    f"{sign}{int(d['diff']):,}",
+                    pct_str,
+                    reference_rate_str(cur_v, cur_sessions),
+                    reference_rate_str(prev_v, prev_sessions),
+                ]
+
+            for item in shown:
+                rows.append(event_row(str(item['name'])[:20], item['current'], item['previous']))
+            if folded:
+                rows.append(event_row(
+                    f'その他（{len(folded)}種）',
+                    sum(i['current'] for i in folded),
+                    sum(i['previous'] for i in folded),
+                ))
             # クリック・電話タップ等であり、実際の予約成立とは限らないため「アクション」と表記する。
-            if res_cur_total > 0 or res_prev_total > 0:
+            if has_res_row:
                 res_diff = calc_diff(res_cur_total, res_prev_total)
                 sign = '+' if res_diff['diff'] > 0 else ''
                 pct_str = f"{sign}{res_diff['pct']:.1f}%" if res_diff['pct'] is not None else 'N/A'
@@ -689,14 +814,14 @@ class CompareReportCanvas:
                     reference_rate_str(res_cur_total, cur_sessions),
                     reference_rate_str(res_prev_total, prev_sessions),
                 ])
-            # 合計行
+            # 合計行（この表の内訳＝予約・電話等の和。求人関連は右の別表で小計する）
             total_cur = sum(i['current'] for i in compared_kevents)
             total_prev = sum(i['previous'] for i in compared_kevents)
             total_diff = calc_diff(total_cur, total_prev)
             sign = '+' if total_diff['diff'] > 0 else ''
             pct_str = f"{sign}{total_diff['pct']:.1f}%" if total_diff['pct'] is not None else 'N/A'
             rows.append([
-                '合計',
+                '合計（求人関連を除く）' if compared_recruit else '合計',
                 f"{total_cur:,}",
                 f"{total_prev:,}",
                 f"{sign}{int(total_diff['diff']):,}",
@@ -705,19 +830,82 @@ class CompareReportCanvas:
                 reference_rate_str(total_prev, prev_sessions),
             ])
 
-            col_ws = [42 * mm, 22 * mm, 22 * mm, 22 * mm, 22 * mm, 20 * mm, 20 * mm]
             self._comparison_table(margin, table_y - 5 * mm, headers, rows, col_ws)
-            note_y = table_y - (len(rows) + 1) * 7 * mm - 4 * mm
-            self._text_wrapped(
-                margin, note_y,
-                '※ 参考比率 = キーイベント発生回数 ÷ セッション数。GA4のセッションCVRではなく、同一セッション内の複数回発生を含みます。',
-                max_width=PAGE_W - 20 * mm,
-                font_size=6.3,
-                color=COLOR_GRAY,
-                max_lines=2,
-            )
+            # 表は table_y - 5mm から描くため、下端はその分も差し引く
+            # （差し引かないと注記が最終行「合計」に重なっていた）。
+            note_y = table_y - 5 * mm - (len(rows) + 1) * 7 * mm - 4 * mm
+            for note, n_lines in zip(table_notes, note_line_counts):
+                self._text_wrapped(
+                    margin, note_y, note,
+                    max_width=note_w,
+                    font_size=6.3,
+                    color=COLOR_GRAY,
+                    max_lines=2,
+                )
+                note_y -= n_lines * 4 * mm
+        else:
+            # 比較不能でも、イベント名から判定した月があることは明示する
+            inferred_note = key_events_inferred_note(cur_kpis, prev_kpis)
+            if inferred_note:
+                self._text_wrapped(
+                    margin + 2 * mm, content_top - 25 * mm, inferred_note,
+                    max_width=PAGE_W - 24 * mm, font_size=7,
+                    color=COLOR_GRAY, max_lines=2,
+                )
+
+        # --- 右下: 求人関連（別カテゴリ）。予約・電話等の合計・参考比率には含めない ---
+        if compared_recruit:
+            self._draw_recruit_events_table(compared_recruit, cur_label, prev_label,
+                                            x=margin + 176 * mm,
+                                            y=content_top - 72 * mm - 5 * mm)
 
         self._footer(company_name, 4)
+
+    def _draw_recruit_events_table(self, compared_recruit, cur_label, prev_label, x, y):
+        """求人関連イベントの別表（行＋「求人関連 小計」）と注記を描く。"""
+        width = PAGE_W - 10 * mm - x
+        col_ws = [width - 54 * mm, 18 * mm, 18 * mm, 18 * mm]
+        # 表と注記がフッターに食い込まない行数に抑える（超過分は「その他」に集約）
+        note_h = 3 * 3.2 * mm
+        max_rows = int((y - 12 * mm - note_h) // (7 * mm)) - 1  # 見出し行を除く
+        max_event_rows = max(1, max_rows - 1)  # 小計行を除く
+        shown = list(compared_recruit)
+        folded = []
+        if len(shown) > max_event_rows:
+            shown, folded = shown[:max_event_rows - 1], shown[max_event_rows - 1:]
+
+        name_w = col_ws[0] - 4 * mm
+
+        def fit(name):
+            name = str(name)
+            if pdfmetrics.stringWidth(name, JP_FONT, 8) <= name_w:
+                return name
+            while name and pdfmetrics.stringWidth(name + '…', JP_FONT, 8) > name_w:
+                name = name[:-1]
+            return name + '…'
+
+        def row(name, cur_v, prev_v):
+            d = int(cur_v) - int(prev_v)
+            sign = '+' if d > 0 else ''
+            return [fit(name), f'{int(cur_v):,}', f'{int(prev_v):,}', f'{sign}{d:,}']
+
+        rows = [row(i['name'], i['current'], i['previous']) for i in shown]
+        if folded:
+            rows.append(row(f'その他（{len(folded)}種）',
+                            sum(i['current'] for i in folded),
+                            sum(i['previous'] for i in folded)))
+        rows.append(row('求人関連 小計',
+                        sum(i['current'] for i in compared_recruit),
+                        sum(i['previous'] for i in compared_recruit)))
+        self._comparison_table(x, y, ['求人関連イベント', cur_label, prev_label, '増減'],
+                               rows, col_ws)
+        note_y = y - (len(rows) + 1) * 7 * mm - 4 * mm
+        self._text_wrapped(
+            x, note_y,
+            '※ 求人関連: 求人応募ボタン・求人サイトへのリンク等（イベント名に「求人」「採用」'
+            '「recruit」「まいなび」等を含むもの）。左表の合計・参考比率には含めず別集計。',
+            max_width=width, font_size=6.3, color=COLOR_GRAY, max_lines=3,
+        )
 
     def draw_pages_compare(self, pages_chart_bytes, cur_pages, prev_pages, company_name=''):
         """P5: 上位ページ比較（20件テーブル）"""
@@ -828,6 +1016,9 @@ class CompareReportCanvas:
             return int(df.iloc[:, 1].head(top_n).sum())
 
         def fmt_sec(sec):
+            # 上位ページのPVが無い月は1PVあたりの時間を算出できない。0秒と書かず取得不能とする。
+            if sec is None:
+                return '取得不能'
             sec = max(0, float(sec))
             m = int(sec // 60)
             s = int(sec % 60)
@@ -839,8 +1030,8 @@ class CompareReportCanvas:
         prev_top_pv = sum_top_pv(prev_pages, 20)
         cur_total_eng = float(cur_kpis.get('avg_engage_sec', 0)) * float(cur_kpis.get('active_users', 0))
         prev_total_eng = float(prev_kpis.get('avg_engage_sec', 0)) * float(prev_kpis.get('active_users', 0))
-        cur_eng_per_pv = (cur_total_eng / cur_top_pv) if cur_top_pv > 0 else 0
-        prev_eng_per_pv = (prev_total_eng / prev_top_pv) if prev_top_pv > 0 else 0
+        cur_eng_per_pv = (cur_total_eng / cur_top_pv) if cur_top_pv > 0 else None
+        prev_eng_per_pv = (prev_total_eng / prev_top_pv) if prev_top_pv > 0 else None
 
         # 1PVあたり平均滞在時間（目安）をタイトル横に表示
         table_y = content_top
@@ -868,15 +1059,20 @@ class CompareReportCanvas:
                 name = r['page']
                 cur_pv = int(r['cur'])
                 prev_pv = int(r['prev'])
-                cur_est_sec = cur_pv * cur_eng_per_pv
-                prev_est_sec = prev_pv * prev_eng_per_pv
-                diff_sec = cur_est_sec - prev_est_sec
+                cur_est_sec = cur_pv * cur_eng_per_pv if cur_eng_per_pv is not None else None
+                prev_est_sec = prev_pv * prev_eng_per_pv if prev_eng_per_pv is not None else None
+                if cur_est_sec is None or prev_est_sec is None:
+                    diff_sec = 0
+                    diff_txt = '取得不能'
+                else:
+                    diff_sec = cur_est_sec - prev_est_sec
+                    diff_txt = f'{fmt_sec(abs(diff_sec))}{"↑" if diff_sec > 0 else "↓" if diff_sec < 0 else "→"}'
                 rows.append([
                     str(idx),
                     short_page(name),
                     fmt_sec(cur_est_sec),
                     fmt_sec(prev_est_sec),
-                    f'{fmt_sec(abs(diff_sec))}{"↑" if diff_sec > 0 else "↓" if diff_sec < 0 else "→"}',
+                    diff_txt,
                 ])
                 row_diffs.append(diff_sec)
 
@@ -1121,23 +1317,37 @@ class CompareReportCanvas:
             new_users = int(kpis.get('new_users', 0))
             key_events_total = int(kpis.get('key_events_total', 0))
             key_events_status = kpis.get('key_events_status', 'missing')
-            avg_engage_sec = float(kpis.get('avg_engage_sec', 0))
+            recruit_total = int(kpis.get('key_events_recruit_total', 0))
 
-            key_event_comment = (
-                'キーイベント明細はCSVに未出力のため、発生回数は評価できません。'
-                if key_events_status == 'missing'
-                else f'予約・電話などのキーイベント発生回数は合計 {key_events_total:,} 件でした。'
-            )
+            if key_events_status == 'missing':
+                key_event_comment = 'キーイベント明細はCSVに未出力のため、発生回数は評価できません。'
+            elif key_events_status == KEY_EVENTS_INFERRED:
+                key_event_comment = f'イベント名から判定した予約・電話などの発生回数は合計 {key_events_total:,} 件でした。'
+            else:
+                key_event_comment = f'予約・電話などのキーイベント発生回数は合計 {key_events_total:,} 件でした。'
+            if recruit_total > 0:
+                key_event_comment += f'求人関連のイベント {recruit_total:,} 件は含めず別に集計しています。'
+            # 値は「アクティブユーザーあたりの平均エンゲージメント時間」（KPIカードと同じ値）。
+            # 旧表記「1セッションあたり」は指標の実体と異なっていた。
             single_comments = [
                 f"今月のアクセス数は {sessions:,} 件、アクティブユーザーは {active_users:,} 人でした。",
                 f"新しく来訪したユーザーは {new_users:,} 人でした。{key_event_comment}",
-                f"1セッションあたりの平均エンゲージ時間は {avg_engage_sec:.1f} 秒でした。",
+                f"アクティブユーザーあたりの平均エンゲージメント時間は {kpis.get('avg_engage_str', '-')}でした。",
                 "次月は、成果につながったページの見出しと導線を優先的に整え、予約ボタン周辺の文言を統一して改善を進めることを推奨します。",
             ]
-            for i, txt in enumerate(single_comments):
-                y = ry - i * 6.4 * mm
-                self._text(right_x + 2 * mm, y, f'• {txt}', font_size=7.8, color=COLOR_DARK)
-            ay = ry - len(single_comments) * 6.4 * mm
+            # 1行描画だと右端ぎりぎりまで伸びていたため、右余白を残して折り返す
+            # （行頭の「•」の右に本文を揃え、折り返し行も同じ位置から始める）
+            text_x = right_x + 5 * mm
+            single_max_w = PAGE_W - text_x - 12 * mm
+            line_h = 7.8 * 1.35
+            y = ry
+            for txt in single_comments:
+                self._text(right_x + 2 * mm, y, '•', font_size=7.8, color=COLOR_DARK)
+                used = self._text_wrapped(text_x, y, txt,
+                                          max_width=single_max_w, font_size=7.8,
+                                          color=COLOR_DARK, max_lines=3)
+                y -= max(used, 1) * line_h + (6.4 * mm - line_h)
+            ay = y
         else:
             good_points = highlights.get('good_points', [])
             improve_points = highlights.get('improve_points', [])
@@ -1639,7 +1849,8 @@ class CompareReportCanvas:
 
         self._footer(company_name, page_num)
 
-    def draw_glossary(self, company_name='', page_num=10, country_note='', incomplete_note=''):
+    def draw_glossary(self, company_name='', page_num=10, country_note='', incomplete_note='',
+                      key_events_note=''):
         """P8: 用語解説"""
         self._bg(COLOR_LIGHT)
         self._page_title_bar('用語解説・注記')
@@ -1676,9 +1887,48 @@ class CompareReportCanvas:
              '30日アクティブは暦月の集計とは一致しない（31日ある月は初日が窓から外れる）。'),
         ]
 
+        # 注記（先に行数を測り、用語表と注記がフッターに食い込まないよう配置を決める）
+        # 国別データに基づく正確な対象範囲の注記（虚偽の「海外除外済み」は使わない）
+        country_line = (country_note or
+                        '※ 本レポートはGA4エクスポートCSVに基づいています。').lstrip('※ ').strip()
+        notes = [
+            '• 本レポートのデータはGA4（Google Analytics 4）からエクスポートされたCSVに基づいています。',
+            '• ' + country_line,
+            '• ユーザー数はCookieベースの推定値であり、実際のユニークユーザー数とは異なる場合があります。',
+            '• 「推定接触量」はページ別の実測滞在時間ではなく、全体のエンゲージ時間をPV比で按分した推定値です。',
+        ]
+        if key_events_note:
+            notes.append('• ' + key_events_note.lstrip('※ ').strip())
+        notes.append(f'• 本レポートの生成バージョン: v{REPORT_VERSION}')
+        if incomplete_note:
+            notes.append('• ' + incomplete_note.lstrip('※ ').strip())
+
+        note_w = PAGE_W - margin - 5 * mm - 12 * mm
+        note_lines = [max(len(self._wrap_lines(n, note_w, 6.5, max_lines=3)), 1) for n in notes]
+        total_lines = sum(note_lines)
+
+        # 最終行のベースラインはフッター線（10mm）より上に保つ。
+        # 注記が増えたときは行間 → 用語表の行高の順に詰める（通常時は従来どおり）。
+        last_baseline_min = 11.5 * mm
+        row_h = 11.5 * mm
+        line_gap = 4.2 * mm
+        min_gap = 3.4 * mm
+
+        def first_baseline(rh):
+            return content_top - 14 * mm - len(terms) * rh - 4 * mm - 7 * mm
+
+        steps = max(total_lines - 1, 1)
+        if first_baseline(row_h) - (total_lines - 1) * line_gap < last_baseline_min:
+            line_gap = max(min_gap, (first_baseline(row_h) - last_baseline_min) / steps)
+            if first_baseline(row_h) - (total_lines - 1) * line_gap < last_baseline_min:
+                row_h = max(
+                    10.8 * mm,
+                    (content_top - 25 * mm - last_baseline_min - (total_lines - 1) * line_gap)
+                    / len(terms),
+                )
+
         self._section_header(margin, content_top, '用語解説')
 
-        row_h = 11.5 * mm
         for i, (term, desc) in enumerate(terms):
             ty = content_top - 14 * mm - i * row_h
 
@@ -1697,26 +1947,13 @@ class CompareReportCanvas:
         note_top = content_top - 14 * mm - len(terms) * row_h - 4 * mm
         self._section_header(margin, note_top, '注記')
 
-        # 国別データに基づく正確な対象範囲の注記（虚偽の「海外除外済み」は使わない）
-        country_line = (country_note or
-                        '※ 本レポートはGA4エクスポートCSVに基づいています。').lstrip('※ ').strip()
-        notes = [
-            '• 本レポートのデータはGA4（Google Analytics 4）からエクスポートされたCSVに基づいています。',
-            '• ' + country_line,
-            '• ユーザー数はCookieベースの推定値であり、実際のユニークユーザー数とは異なる場合があります。',
-            '• 「推定接触量」はページ別の実測滞在時間ではなく、全体のエンゲージ時間をPV比で按分した推定値です。',
-            f'• 本レポートの生成バージョン: v{REPORT_VERSION}',
-        ]
-        if incomplete_note:
-            notes.append('• ' + incomplete_note.lstrip('※ ').strip())
-
         # 国別注記が2行になっても、生成バージョンまでフッターより上に収める。
         ny = note_top - 7 * mm
         for note in notes:
             used = self._text_wrapped(margin + 5 * mm, ny, note,
-                                      max_width=PAGE_W - margin - 5 * mm - 12 * mm,
+                                      max_width=note_w,
                                       font_size=6.5, color=COLOR_DARK, max_lines=3)
-            ny -= max(used, 1) * 4.2 * mm
+            ny -= max(used, 1) * line_gap
 
         self._footer(company_name, page_num)
 
@@ -1756,13 +1993,16 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
         cur_data['df_ch_ses'].columns[1] if cur_data['df_ch_ses'] is not None else 'value',
     ) if cur_data['df_ch_ses'] is not None or prev_data['df_ch_ses'] is not None else pd.DataFrame()
 
-    key_events_comparable = (
-        cur_kpis.get('key_events_status') != 'missing'
-        and prev_kpis.get('key_events_status') != 'missing'
-    )
+    key_events_comparable, _ = key_events_comparison(
+        cur_kpis.get('key_events_status'), prev_kpis.get('key_events_status'))
     compared_kevents = compare_key_events(
         cur_kpis.get('key_events', {}),
         prev_kpis.get('key_events', {}),
+    ) if key_events_comparable else []
+    # 求人関連（別カテゴリ）。予約・電話等とは別表・別集計で示す
+    compared_recruit = compare_key_events(
+        cur_kpis.get('key_events_recruit', {}),
+        prev_kpis.get('key_events_recruit', {}),
     ) if key_events_comparable else []
 
     # 3. チャート生成
@@ -1774,7 +2014,10 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
 
     kev_chart = make_key_events_grouped_bar(
         cur_kpis.get('key_events', {}), prev_kpis.get('key_events', {}),
-        cur_label, prev_label) if key_events_comparable else None
+        cur_label, prev_label,
+        title=('キーイベント発生回数比較（求人関連を除く）' if compared_recruit
+               else 'キーイベント発生回数比較'),
+    ) if key_events_comparable else None
 
     pages_chart = make_top_pages_compare_chart(
         cur_data['df_pages'], prev_data['df_pages'])
@@ -1820,6 +2063,7 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
     country_note_short = country_note_text(cur_meta, compact=True)
     incomplete_note = incomplete_note_text(cur_meta, prev_meta, cur_label, prev_label,
                                            single_mode=single_mode)
+    key_events_note = key_events_inferred_note(cur_kpis, prev_kpis)
 
     # 5. PDF生成
     rc = CompareReportCanvas(output_path)
@@ -1845,7 +2089,8 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
     rc.draw_key_events_compare(kev_chart, compared_kevents,
                                cur_label, prev_label, company_name,
                                transition_rate_chart_bytes=transition_rate_chart,
-                               cur_kpis=cur_kpis, prev_kpis=prev_kpis)
+                               cur_kpis=cur_kpis, prev_kpis=prev_kpis,
+                               compared_recruit=compared_recruit)
     rc.new_page()
 
     # P5: ページ比較
@@ -1909,7 +2154,8 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
 
         # P11: 用語解説・注記
         rc.draw_glossary(company_name=company_name, page_num=11,
-                         country_note=country_note_short, incomplete_note=incomplete_note)
+                         country_note=country_note_short, incomplete_note=incomplete_note,
+                         key_events_note=key_events_note)
     else:
         # P6: 上位ページ エンゲージ時間分析
         rc.draw_page_engagement_page(
@@ -1942,7 +2188,8 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
 
         # P9: 用語解説・注記（標準版）
         rc.draw_glossary(company_name=company_name, page_num=9,
-                         country_note=country_note_short, incomplete_note=incomplete_note)
+                         country_note=country_note_short, incomplete_note=incomplete_note,
+                         key_events_note=key_events_note)
 
     rc.save()
     return output_path

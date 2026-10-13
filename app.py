@@ -7,6 +7,7 @@ from datetime import datetime
 from report_logic_compare import generate_compare_report
 from csv_parser import parse_ga4_csv
 from input_validation import validate_csv_inputs
+from csv_merge import CsvMergeError, merge_ga4_csvs
 
 # バージョンはPDF生成側と共有する（出力物からデプロイ状態を判定できるようにするため）
 from report_logic_compare import REPORT_VERSION as APP_VERSION
@@ -175,6 +176,11 @@ st.markdown(
     unsafe_allow_html=True
 )
 st.write("GA4からエクスポートしたCSVをアップロードしてレポートを自動生成します。**比較したい月** のCSVが未指定の場合は、**単月モード** として分析します。")
+st.caption(
+    "GA4の「レポートのスナップショット」だけでは必要な項目が揃わない場合は、同じ期間で出力した"
+    "「レポートのスナップショット」「集客サマリー」「エンゲージメントの概要」（任意で「イベント」）を"
+    "まとめて選択してください。同じ月の複数ファイルは1セットとして結合して読み込みます。"
+)
 
 st.divider()
 
@@ -202,29 +208,53 @@ col1, col2 = st.columns([1, 1])
 with col1:
     st.subheader("1. データのインポート")
 
-    st.markdown("**当月のCSV**")
-    uploaded_cur = st.file_uploader("当月のGA4エクスポートCSV", type=["csv"], key="cur_csv")
+    st.markdown("**当月のCSV**（同じ月の複数ファイル可）")
+    uploaded_cur = st.file_uploader("当月のGA4エクスポートCSV", type=["csv"], key="cur_csv",
+                                    accept_multiple_files=True)
 
-    st.markdown("**比較したい月のCSV**")
-    uploaded_prev = st.file_uploader("比較したい月のGA4エクスポートCSV", type=["csv"], key="prev_csv")
+    st.markdown("**比較したい月のCSV**（同じ月の複数ファイル可）")
+    uploaded_prev = st.file_uploader("比較したい月のGA4エクスポートCSV", type=["csv"], key="prev_csv",
+                                     accept_multiple_files=True)
 
     uploaded_logo = st.file_uploader("ロゴを入れたい場合（任意）", type=["png", "jpg", "jpeg"])
 
 with col2:
     st.subheader("2. レポートの生成")
 
-    if uploaded_cur is not None:
-        single_mode = uploaded_prev is None
+    if uploaded_cur:
+        single_mode = not uploaded_prev
         if single_mode:
-            st.success("当月CSVが読み込めました（単月モードで生成できます）")
+            st.success(f"当月CSVが読み込めました（{len(uploaded_cur)}ファイル・単月モードで生成できます）")
             st.info("比較したい月のCSVが未指定のため、当月データを基準に単月分析レポートを生成します。")
         else:
-            st.success("2つのCSVファイルが読み込めました！")
+            st.success(
+                f"CSVファイルが読み込めました！（当月 {len(uploaded_cur)}ファイル / "
+                f"比較月 {len(uploaded_prev)}ファイル）"
+            )
 
         button_label = "🚀 単月分析PDFレポートを生成する" if single_mode else "🚀 比較PDFレポートを生成する"
         if st.button(button_label):
-            cur_bytes = uploaded_cur.getvalue()
-            prev_bytes = cur_bytes if single_mode else uploaded_prev.getvalue()
+            # 同じ月の複数ファイルを1セットに結合する。プロパティ・期間が
+            # ファイル間で異なる場合は結合せずに止める（別の月・別の医院の混在防止）。
+            merge_errors = []
+            cur_bytes = prev_bytes = None
+            try:
+                cur_bytes = merge_ga4_csvs([f.getvalue() for f in uploaded_cur],
+                                           names=[f.name for f in uploaded_cur])
+            except CsvMergeError as exc:
+                merge_errors.append(f"当月CSV: {exc}")
+            if not single_mode:
+                try:
+                    prev_bytes = merge_ga4_csvs([f.getvalue() for f in uploaded_prev],
+                                                names=[f.name for f in uploaded_prev])
+                except CsvMergeError as exc:
+                    merge_errors.append(f"比較月CSV: {exc}")
+            if merge_errors:
+                for err in merge_errors:
+                    st.error(err)
+                st.stop()
+            if single_mode:
+                prev_bytes = cur_bytes
 
             # 必須項目・出力元・比較条件に問題がある場合は生成を止める。
             validation_errors = validate_csv_inputs(
@@ -235,8 +265,9 @@ with col2:
                 for err in validation_errors:
                     st.error(err)
                 st.info(
-                    "GA4で「レポート」→「レポートのスナップショット」を開き、"
-                    "同じ期間を指定してCSVを再出力してください。"
+                    "GA4で同じ期間を指定し、不足項目の出力元に示した画面（「レポートのスナップショット」"
+                    "「集客サマリー」「エンゲージメントの概要」）からCSVを出力して、"
+                    "同じ月のファイルをまとめてアップロードしてください。"
                 )
                 st.stop()
 

@@ -7,6 +7,26 @@
 import pandas as pd
 import numpy as np
 
+from csv_parser import KEY_EVENTS_INFERRED
+
+
+def key_events_comparison(cur_status: str, prev_status: str) -> tuple:
+    """キーイベント発生回数を前月比較してよいかを返す: (comparable, reason)。
+
+    reason:
+      'missing'         いずれかの月でキーイベントが未出力（0件として扱わない）
+      'method_mismatch' 片方がGA4のキーイベント明細、片方がイベント名からの判定で、
+                        集計方法が異なる（差を増減として示すと誤解を招く）
+      ''                比較可能
+    """
+    cur_status = cur_status or 'missing'
+    prev_status = prev_status or 'missing'
+    if cur_status == 'missing' or prev_status == 'missing':
+        return False, 'missing'
+    if (cur_status == KEY_EVENTS_INFERRED) != (prev_status == KEY_EVENTS_INFERRED):
+        return False, 'method_mismatch'
+    return True, ''
+
 
 def calc_diff(current, previous) -> dict:
     """増減計算。current/previous は数値。
@@ -48,6 +68,8 @@ def calc_diff(current, previous) -> dict:
 def format_delta(diff_dict: dict) -> str:
     """"+1,234 (+12.3%) ▲" 形式の文字列を返す"""
     if diff_dict.get('comparable') is False:
+        if diff_dict.get('incomparable_reason') == 'method_mismatch':
+            return '比較不能（集計方法が異なる）'
         return '比較不能（未出力）'
 
     diff = diff_dict['diff']
@@ -95,9 +117,10 @@ def compare_kpis(cur_kpis: dict, prev_kpis: dict) -> dict:
         if k == 'key_events_total':
             cur_status = cur_kpis.get('key_events_status', 'missing')
             prev_status = prev_kpis.get('key_events_status', 'missing')
-            comparable = cur_status != 'missing' and prev_status != 'missing'
+            comparable, reason = key_events_comparison(cur_status, prev_status)
             diff.update({
                 'comparable': comparable,
+                'incomparable_reason': reason,
                 'current_status': cur_status,
                 'previous_status': prev_status,
             })
@@ -173,11 +196,15 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
             'summary_bullets': [str, ...],
         }
     """
+    kev_inferred = (
+        compared_kpis.get('key_events_total', {}).get('current_status') == KEY_EVENTS_INFERRED
+    )
+    kev_label = 'キーイベント発生回数（イベント名から判定）' if kev_inferred else 'キーイベント発生回数'
     kpi_labels = {
         'active_users': 'アクティブユーザー',
         'new_users': '新規ユーザー',
         'sessions': 'セッション数',
-        'key_events_total': 'キーイベント発生回数',
+        'key_events_total': kev_label,
     }
 
     # KPIで最も改善/悪化した指標
@@ -284,6 +311,7 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
     # セクション未出力と、出力済み0件を区別する。
     # 未出力を0件として比較すると、存在しない-100%減少を作ってしまう。
     cv_missing = kev.get('comparable') is False
+    cv_method_mismatch = cv_missing and kev.get('incomparable_reason') == 'method_mismatch'
     cv_zero = (
         not cv_missing
         and int(kev.get('current', 0)) == 0
@@ -310,11 +338,11 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
 
     if not cv_missing and not cv_zero and kev.get('pct') is not None and kev.get('diff', 0) != 0:
         if kev.get('diff', 0) > 0:
-            headline_lines.append(f"キーイベント発生回数は前月比 {_pct(kev):.1f}% 増加")
-            facts_up.append(f"キーイベント発生回数が前月比 {_pct(kev):.1f}% 増えました。")
+            headline_lines.append(f"{kev_label}は前月比 {_pct(kev):.1f}% 増加")
+            facts_up.append(f"{kev_label}が前月比 {_pct(kev):.1f}% 増えました。")
         else:
-            headline_lines.append(f"キーイベント発生回数は前月比 {_pct(kev):.1f}% 減少")
-            facts_down.append(f"キーイベント発生回数が前月比 {_pct(kev):.1f}% 減りました。")
+            headline_lines.append(f"{kev_label}は前月比 {_pct(kev):.1f}% 減少")
+            facts_down.append(f"{kev_label}が前月比 {_pct(kev):.1f}% 減りました。")
 
     if eng.get('pct') is not None and eng.get('diff', 0) != 0:
         if eng.get('diff', 0) > 0:
@@ -322,7 +350,9 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
         else:
             facts_down.append(f"平均エンゲージメント時間が前月比 {_pct(eng):.1f}% 短くなりました。")
 
-    if cv_missing:
+    if cv_method_mismatch:
+        headline_lines.append('キーイベントの集計方法が当月と前月で異なるため、前月比較はできません')
+    elif cv_missing:
         headline_lines.append('キーイベントデータが未出力のため、前月比較はできません')
     elif cv_zero:
         headline_lines.append('キーイベントは両月とも0件のため、成果の増減は判断できません')
@@ -331,15 +361,25 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
     # (priority, text) 。priority が大きいほど優先。
     scored_actions = []
 
-    if cv_missing:
+    if cv_method_mismatch:
+        scored_actions.append((210,
+            'キーイベントの集計方法が当月と前月で異なる（一方はGA4のキーイベント明細、'
+            '他方はイベント名からの判定）。両月を同じ形式のCSVで出力し直すと比較できる。'
+            '（根拠: キーイベントの出力形式が月ごとに異なる）'))
+    elif cv_missing:
         scored_actions.append((210,
             'GA4のレポートにキーイベント明細を追加して再出力する。CSVに明細が無いため、0件なのか未出力なのかを判定できず、前月比較は行っていない。'
             '（根拠: キーイベントセクション未出力）'))
     elif cv_zero:
+        zero_basis = (
+            '（根拠: イベント名から判定した予約・電話等のイベントが当月・前月とも0件）'
+            if kev_inferred else
+            '（根拠: 当月・前月ともキーイベント発生回数0件）'
+        )
         scored_actions.append((200,
             'GA4で予約ボタン・電話タップ・問い合わせ送信をキーイベントに設定し、成果を計測できる状態にする。'
             'これが無い限り、集客施策も広告も効果を評価できない。'
-            '（根拠: 当月・前月ともキーイベント発生回数0件）'))
+            + zero_basis))
 
     # チャネルの変動: GA4のこのCSVでは「なぜ変わったか」は分からない。確認先を示す。
     top_ch = highlights.get('top_channel_change', {})
