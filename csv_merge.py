@@ -14,12 +14,17 @@ GA4「レポートのスナップショット」の構成が変わり、日別�
   メタ情報は先頭ファイル基準で読まれるため）。無ければ入力順。
 - 同じセット内でプロパティ名・開始日・終了日が異なる場合は結合せずエラーにする。
   別の月や別の医院のCSVを混ぜたまま数値を作らないため。
+- 開始日・終了日が日付として読めない、または開始日が終了日より後ならエラーにする（v9）。
+- 内容が完全に同じファイルを二重に指定した場合は、2つ目以降を読み込まず注意を返す（v9。
+  二重に指定しても件数が倍にならないようにするため）。
+- 各ファイルのレポート名の次の行に「# 入力ファイル: ファイル名」を入れる（v9）。
+  csv_parser が、表の不一致や数値の欠損をファイル名つきで示すために使う。
 """
 
 import os
 import re
 
-from csv_parser import _decode_text
+from csv_parser import FILE_MARKER_PREFIX, _decode_text, parse_yyyymmdd, read_meta
 
 SNAPSHOT_TITLE = 'レポートのスナップショット'
 
@@ -42,15 +47,14 @@ def report_title(text: str) -> str:
 
 
 def _file_meta(text: str) -> dict:
-    """csv_parser.parse_ga4_csv と同じ規則（最初の出現）でプロパティと期間を読む。"""
-    prop = re.search(r'プロパティ:\s*(.+)', text)
-    start_d = re.search(r'開始日:\s*(\d{8})', text)
-    end_d = re.search(r'終了日:\s*(\d{8})', text)
+    """csv_parser.parse_ga4_csv と同じ規則（行単位・最初の出現）でプロパティと期間を読む。"""
+    meta = read_meta(text)
     return {
         'title': report_title(text),
-        'property': prop.group(1).strip() if prop else '',
-        'start': start_d.group(1) if start_d else '',
-        'end': end_d.group(1) if end_d else '',
+        'property': meta['property'],
+        'property_line': meta['property_line'],
+        'start': meta['start'],
+        'end': meta['end'],
     }
 
 
@@ -81,6 +85,19 @@ def _odd_ones(entries: list, key) -> list:
     return [e for e in entries if key(e) != majority]
 
 
+def _with_file_marker(text: str, name: str) -> str:
+    """レポート名の行の次に「# 入力ファイル: name」を入れる（レポート名が無ければ先頭）。"""
+    lines = text.splitlines(keepends=True)
+    nl = '\r\n' if text.find('\r\n') >= 0 else '\n'
+    marker = f'{FILE_MARKER_PREFIX} {name}{nl}'
+    for i, line in enumerate(lines[:12]):
+        if re.match(r'^#\s*-{5,}\s*$', line.strip()) and i + 1 < len(lines):
+            if report_title(text):
+                return ''.join(lines[:i + 2] + [marker] + lines[i + 2:])
+            break
+    return marker + text
+
+
 def merge_ga4_csvs(files, names=None) -> bytes:
     """GA4エクスポートCSVを1セットとして結合し、UTF-8のbytesを返す。
 
@@ -88,6 +105,14 @@ def merge_ga4_csvs(files, names=None) -> bytes:
     names: エラー表示用のファイル名リスト（省略時はパスのファイル名または「ファイルN」）
 
     1ファイルだけの場合は入力をそのまま返す（従来の単一CSVと完全に同じ挙動）。
+    """
+    return merge_ga4_csvs_with_notes(files, names)[0]
+
+
+def merge_ga4_csvs_with_notes(files, names=None) -> tuple:
+    """merge_ga4_csvs と同じ結合を行い、(bytes, 注意メッセージのリスト) を返す。
+
+    注意メッセージ: 内容が同じファイルを二重に指定したため2つ目以降を読み込まなかった旨。
     """
     files = list(files or [])
     if not files:
@@ -101,30 +126,56 @@ def merge_ga4_csvs(files, names=None) -> bytes:
     if len(files) == 1:
         only = files[0]
         if isinstance(only, (bytes, bytearray)):
-            return bytes(only)
-        return _decode_text(only).encode('utf-8')
+            return bytes(only), []
+        return _decode_text(only).encode('utf-8'), []
 
+    notes = []
     entries = []
+    seen = {}
     for i, (src, name) in enumerate(zip(files, names)):
         text = _decode_text(src)
+        key = text.strip()
+        if key in seen:
+            # 同じ内容のファイルの二重指定。合算すると倍になるため、2つ目以降は読まない
+            notes.append(f'「{name}」は「{seen[key]}」と同じ内容のため、2つ目以降は読み込みませんでした。')
+            continue
+        seen[key] = name
         meta = _file_meta(text)
         entries.append({'index': i, 'name': name, 'text': text, **meta})
 
+    if len(entries) == 1:
+        return entries[0]['text'].encode('utf-8'), notes
+
     unreadable = [e for e in entries if not (e['property'] and e['start'] and e['end'])]
     if unreadable:
-        detail = '、'.join(
-            f"{e['name']}（"
-            + '・'.join(
-                label for label, ok in (
-                    ('プロパティ', e['property']), ('開始日', e['start']), ('終了日', e['end']),
-                ) if not ok
-            )
-            + 'が読み取れません）'
-            for e in unreadable
-        )
+        def _why(e):
+            parts = []
+            missing = [label for label, ok in (('開始日', e['start']), ('終了日', e['end'])) if not ok]
+            if not e['property']:
+                if e['property_line']:
+                    parts.append('プロパティ名が空です')
+                else:
+                    missing.insert(0, 'プロパティ')
+            if missing:
+                parts.append('・'.join(missing) + 'が読み取れません')
+            return '、'.join(parts)
+
+        detail = '、'.join(f"{e['name']}（{_why(e)}）" for e in unreadable)
         raise CsvMergeError(
             f'同じセットとして確認できないCSVがあります: {detail}。'
             'GA4のレポート画面からエクスポートしたCSVか確認してください。'
+        )
+
+    bad_dates = [
+        e for e in entries
+        if not (parse_yyyymmdd(e['start']) and parse_yyyymmdd(e['end']))
+        or parse_yyyymmdd(e['start']) > parse_yyyymmdd(e['end'])
+    ]
+    if bad_dates:
+        raise CsvMergeError(
+            '開始日・終了日が正しくないCSVがあります: '
+            + '、'.join(_desc(e, 'period') for e in bad_dates)
+            + '。開始日が終了日以前の正しい日付になっているか確認してください。'
         )
 
     # 先頭にスナップショットを置く（複数あれば入力順で最初のもの）。他は入力順。
@@ -156,8 +207,9 @@ def merge_ga4_csvs(files, names=None) -> bytes:
         )
 
     # 各ファイルの最終セクションが次ファイルのヘッダと連続しないよう、空行を挟んで連結する。
-    merged = '\n\n'.join(e['text'].rstrip('\r\n') for e in ordered) + '\n'
-    return merged.encode('utf-8')
+    merged = '\n\n'.join(
+        _with_file_marker(e['text'], e['name']).rstrip('\r\n') for e in ordered) + '\n'
+    return merged.encode('utf-8'), notes
 
 
 def _desc(entry: dict, kind: str) -> str:

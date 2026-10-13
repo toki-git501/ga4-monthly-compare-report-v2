@@ -28,16 +28,21 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 from PIL import Image as PILImage
 
-from csv_parser import parse_ga4_csv, KEY_EVENTS_INFERRED, KEY_EVENTS_INFERRED_NOTE
+from csv_parser import (
+    parse_ga4_csv, KEY_EVENTS_INFERRED, KEY_EVENTS_INFERRED_NOTE, KEY_EVENTS_FALLBACK,
+    has_event_breakdown,
+)
+from event_classify import is_reservation_or_phone
 
 # 出力PDFに刻む生成バージョン。
 # デプロイが反映されたかを、出力物そのもので判定できるようにするため。
 # ロジックを変更したら必ず更新すること。
-REPORT_VERSION = '2026-10-13-v8'
+REPORT_VERSION = '2026-10-13-v9'
 from compare_utils import (
     calc_diff, format_delta, delta_color,
     compare_kpis, compare_dataframes, compare_key_events, compute_highlights,
-    select_top_pages, key_events_comparison,
+    select_top_pages, key_events_comparison, incomparable_text, shorten_labels_unique,
+    treatment_mismatch_events,
 )
 from chart_generator_compare import (
     make_daily_overlay_chart, make_channel_grouped_bar,
@@ -180,11 +185,13 @@ def incomplete_note_text(cur_meta: dict, prev_meta: dict,
 
 
 def key_events_status_text(kpis: dict) -> str:
-    """キーイベント発生回数の表示文字列。未出力は0件と書かない。"""
+    """キーイベント発生回数の表示文字列。未出力・内訳取得不能は0件と書かない。"""
     kpis = kpis or {}
     status = kpis.get('key_events_status', 'missing')
     if status == 'missing':
         return '未出力'
+    if status == KEY_EVENTS_FALLBACK:
+        return '内訳取得不能'
     total = int(kpis.get('key_events_total', 0))
     if status == KEY_EVENTS_INFERRED:
         return f'{total:,}件（イベント名から判定）'
@@ -212,23 +219,275 @@ def has_recruit_events(*kpis_list) -> bool:
     return any(int((k or {}).get('key_events_recruit_total', 0)) > 0 for k in kpis_list)
 
 
-def recruit_events_note(cur_kpis: dict, prev_kpis: dict) -> str:
+def _status_count_text(kpis: dict, total_key: str) -> str:
+    """別集計（求人関連・完了到達・未分類）の件数表示。内訳が無い月は0件と書かない。"""
+    kpis = kpis or {}
+    status = kpis.get('key_events_status', 'missing')
+    if status == 'missing':
+        return '未出力'
+    if not has_event_breakdown(status):
+        return '取得不能'
+    return f'{int(kpis.get(total_key, 0)):,}件'
+
+
+def _side_counts_text(cur_kpis, prev_kpis, total_key, single_mode=False) -> str:
+    cur_txt = _status_count_text(cur_kpis, total_key)
+    if single_mode:
+        return f'当月 {cur_txt}'
+    prev_txt = _status_count_text(prev_kpis, total_key)
+    comparable, reason = key_events_comparison(
+        (cur_kpis or {}).get('key_events_status'), (prev_kpis or {}).get('key_events_status'))
+    if comparable:
+        cur_t = int((cur_kpis or {}).get(total_key, 0))
+        prev_t = int((prev_kpis or {}).get(total_key, 0))
+        delta = format_delta(calc_diff(cur_t, prev_t))
+        return f'当月 {cur_txt} / 前月 {prev_txt}（{delta}）'
+    return f'当月 {cur_txt} / 前月 {prev_txt}（比較不能）'
+
+
+def recruit_events_note(cur_kpis: dict, prev_kpis: dict, single_mode: bool = False) -> str:
     """KPIサマリ（P2）用: 求人関連イベントを別集計したことの注記（無ければ空文字）。
 
     求人関連は計測対象だが、予約・電話アクションの合計（バナーの値）には含めない。
+    前月が未出力の場合は「0件」ではなく「未出力」と書く。
     """
     if not has_recruit_events(cur_kpis, prev_kpis):
         return ''
-    cur_t = int((cur_kpis or {}).get('key_events_recruit_total', 0))
-    prev_t = int((prev_kpis or {}).get('key_events_recruit_total', 0))
-    comparable, _ = key_events_comparison(
-        (cur_kpis or {}).get('key_events_status'), (prev_kpis or {}).get('key_events_status'))
-    if comparable:
-        delta = format_delta(calc_diff(cur_t, prev_t))
-        counts = f'当月 {cur_t:,}件 / 前月 {prev_t:,}件（{delta}）'
-    else:
-        counts = f'当月 {cur_t:,}件 / 前月 {prev_t:,}件（比較不能）'
+    counts = _side_counts_text(cur_kpis, prev_kpis, 'key_events_recruit_total', single_mode)
     return f'※ 求人関連のイベント（求人応募ボタン・求人サイトへのリンク等）は上記に含めず別集計: {counts}'
+
+
+def completion_events_note(cur_kpis: dict, prev_kpis: dict, single_mode: bool = False) -> str:
+    """完了到達（外部予約サイト等の完了画面）を合計に含めず別に示したことの注記。"""
+    if not any(int((k or {}).get('key_events_completion_total', 0)) > 0
+               for k in (cur_kpis, prev_kpis)):
+        return ''
+    counts = _side_counts_text(cur_kpis, prev_kpis, 'key_events_completion_total', single_mode)
+    return ('※ 外部の予約サイト等の完了画面に到達した回数（イベント名の末尾が「完了」等のもの）は、'
+            '予約成立数ではなく、クリックの後の段階を数えたものです。上記に含めず別に示しています: '
+            f'{counts}')
+
+
+def completion_counted_note(cur_kpis: dict, prev_kpis: dict) -> str:
+    """対応するクリックのイベントが無いため、完了到達を合計に含めた場合の注記。"""
+    names = []
+    for k in (cur_kpis, prev_kpis):
+        for n in (k or {}).get('key_events_completion_counted') or []:
+            if n not in names:
+                names.append(n)
+    if not names:
+        return ''
+    joined = '」「'.join(names[:3])
+    return (f'※「{joined}」は対応するクリックのイベントが無く、これが唯一の計測のため合計に含めています'
+            '（予約成立数ではありません）。')
+
+
+def unclassified_events_note(cur_kpis: dict, prev_kpis: dict, single_mode: bool = False) -> str:
+    """イベント名から判定できなかったイベントを合計に含めていないことの注記。"""
+    if not any(int((k or {}).get('key_events_unclassified_total', 0)) > 0
+               for k in (cur_kpis, prev_kpis)):
+        return ''
+    names = []
+    for k in (cur_kpis, prev_kpis):
+        for n in ((k or {}).get('key_events_unclassified') or {}):
+            if n not in names:
+                names.append(n)
+    ex = '・'.join(names[:3]) + ('等' if len(names) > 3 else '')
+    counts = _side_counts_text(cur_kpis, prev_kpis, 'key_events_unclassified_total', single_mode)
+    return (f'※ イベント名から予約・電話等と判定できなかったイベント（{ex}）は上記に含めていません: '
+            f'{counts}')
+
+
+def _group_label(g: dict) -> str:
+    names = [g['kept']] + list(g['excluded'])
+    return 'と'.join(f'「{n}」' for n in names)
+
+
+def dedupe_note_text(cur_kpis: dict, prev_kpis: dict, single_mode: bool = False,
+                     with_mark: bool = True) -> str:
+    """同数イベントの一方を合計から除外したことの注記（無ければ空文字）。"""
+    def groups(k):
+        return [(g['kept'], tuple(g['excluded'])) for g in (k or {}).get('key_events_dedup_groups') or []]
+
+    cur_g = groups(cur_kpis)
+    prev_g = [] if single_mode else groups(prev_kpis)
+    items = []
+    for g in cur_g:
+        items.append((g, '' if (single_mode or g in prev_g) else '当月は'))
+    for g in prev_g:
+        if g not in cur_g:
+            items.append((g, '前月は'))
+    if not items:
+        return ''
+    parts = []
+    for (kept, excluded), scope in items:
+        label = _group_label({'kept': kept, 'excluded': excluded})
+        parts.append(f'{scope}同数の{label}')
+    head = '※ ' if with_mark else ''
+    return (head + '、'.join(parts) + 'は、同じ操作を2つのイベントで数えている可能性があるため、'
+            '合計には1つ分のみ含めています。')
+
+
+def dedupe_unverified_note(cur_kpis: dict, prev_kpis: dict, single_mode: bool = False) -> str:
+    """件数は同じだが総ユーザー数が無く確かめられない組の注記（合計からは除外しない）。"""
+    seen = []
+    for k in ((cur_kpis,) if single_mode else (cur_kpis, prev_kpis)):
+        for u in (k or {}).get('key_events_dedup_unverified') or []:
+            label = 'と'.join(f'「{n}」' for n in u['names'])
+            if label not in seen:
+                seen.append(label)
+    if not seen:
+        return ''
+    return ('※ ' + '、'.join(f'同数の{x}' for x in seen)
+            + 'は、同じ操作を2つのイベントで数えている可能性がありますが、総ユーザー数が出力されて'
+            'いないため確かめられず、どちらも合計に含めています（「イベント」レポートのCSVを追加すると確認できます）。')
+
+
+def platform_total_note(cur_kpis: dict, prev_kpis: dict, single_mode: bool = False) -> str:
+    """イベント別の内訳が無く、プラットフォーム合計しか無い月がある場合の注記。"""
+    months = [('当月', cur_kpis)] + ([] if single_mode else [('前月', prev_kpis)])
+    fb = [(lab, k) for lab, k in months if (k or {}).get('key_events_status') == KEY_EVENTS_FALLBACK]
+    if not fb:
+        return ''
+    totals = '・'.join(f"{lab} {int(k.get('key_events_platform_total') or 0):,}件" for lab, k in fb)
+    return ('※ キーイベントのイベント別の内訳が出力されていないため、予約・電話アクションの件数は'
+            f'算出していません（GA4のプラットフォーム別キーイベント合計: {totals}。求人やその他の'
+            'イベントを含むため、予約・電話の件数としては使えません）。「エンゲージメントの概要」または'
+            '「イベント」のCSVを追加してください。')
+
+
+def side_event_items(cur_d: dict, prev_d: dict, cur_status: str, prev_status: str,
+                     single_mode: bool = False) -> list:
+    """別表（求人関連・完了到達・未分類）の行。
+
+    比較できる月どうしは compare_key_events と同じ形式。前月が比較できない場合も
+    当月の明細は表示し、前月の値は「未出力」等、増減は「比較不能」とする。
+    当月にイベント別の内訳が無い場合は空。
+    """
+    if not has_event_breakdown(cur_status):
+        return []
+    comparable, reason = key_events_comparison(cur_status, prev_status)
+    if single_mode or comparable:
+        return compare_key_events(cur_d or {}, prev_d or {})
+    prev_text = {'missing': '未出力', 'breakdown_unavailable': '取得不能'}.get(reason, '—')
+    items = [{'name': k, 'current': int(v), 'previous': None, 'prev_text': prev_text}
+             for k, v in (cur_d or {}).items()]
+    items.sort(key=lambda x: (-x['current'], str(x['name'])))
+    return items
+
+
+# P4 のレイアウト上限
+P4_MAX_EXCLUDED_ROWS = 3        # 左表に残す「同数のため合計から除外」の行（超過分は1行に集約）
+P4_BOTTOM_LIMIT = 12 * mm        # 別表・注記をこれより下に描かない（フッター線は10mm）
+
+
+def allocate_side_rows(item_counts: list, capacity: int):
+    """右側の別表どうしで、明細行の数（小計を除く）を分け合う。
+
+    各表に最低1行、残りを行の多い表から順に1行ずつ配る。capacity が表の数に満たなければ None。
+    割り当てが明細数より少ない表は、最後の1行が「他N件」の集約行になる。
+    """
+    n = len(item_counts)
+    if n == 0:
+        return []
+    if capacity < n:
+        return None
+    alloc = [1] * n
+    left = capacity - n
+    while left > 0:
+        need = [i for i in range(n) if alloc[i] < item_counts[i]]
+        if not need:
+            break
+        for i in sorted(need, key=lambda k: (alloc[k], -item_counts[k], k)):
+            if left <= 0:
+                break
+            alloc[i] += 1
+            left -= 1
+    return [min(a, max(c, 1)) for a, c in zip(alloc, item_counts)]
+
+
+def fold_items(items: list, max_rows: int) -> tuple:
+    """max_rows 行に収める: (表示する行, 「他N件」に集約する行)。集約行も1行に数える。"""
+    items = list(items)
+    if max_rows <= 0 or len(items) <= max_rows:
+        return items, []
+    keep = max(max_rows - 1, 0)
+    return items[:keep], items[keep:]
+
+
+def side_table_summary_text(table: dict, cur_label: str, prev_label: str) -> str:
+    """別表が収まらないときの1文（小計の当月・前月を落とさない）。"""
+    items = table['items']
+    cur_t = sum(int(i['current']) for i in items)
+    if any(i.get('previous') is None for i in items):
+        prev_txt = next((i.get('prev_text') for i in items if i.get('previous') is None), '—')
+        prev_part = f'{prev_label} {prev_txt}（比較不能）'
+    else:
+        prev_part = f"{prev_label} {sum(int(i['previous']) for i in items):,}件"
+    return (f"{table['subtotal']}: {cur_label} {cur_t:,}件 / {prev_part}"
+            f"（{len(items)}種。{table['note'].lstrip('※ ')}）")
+
+
+def treatment_mismatch_note(cur_kpis: dict, prev_kpis: dict, single_mode: bool = False) -> str:
+    """片方の月だけ合計から外したイベントがあり、合計・小計の前月比を出さないことの注記。"""
+    if single_mode:
+        return ''
+    comparable, _ = key_events_comparison((cur_kpis or {}).get('key_events_status'),
+                                          (prev_kpis or {}).get('key_events_status'))
+    if not comparable:
+        return ''
+    mm_list = treatment_mismatch_events(cur_kpis, prev_kpis)
+    if not mm_list:
+        return ''
+    parts = []
+    for m in mm_list[:3]:
+        cur_txt = '含め' if m['cur_included'] else '含めず'
+        prev_txt = '含めた' if m['prev_included'] else '含めなかった'
+        parts.append(f'「{m["name"]}」は当月は合計に{cur_txt}、前月は{prev_txt}')
+    more = f'（ほか{len(mm_list) - 3}件）' if len(mm_list) > 3 else ''
+    return ('※ ' + '、'.join(parts) + more
+            + 'ため（同数の別イベントがある・完了画面への到達として別に数えた、の扱いが月で異なる）、'
+            '合計・小計の前月比は出していません。当月・前月の値は、それぞれの月の規則で集計したものです。')
+
+
+# P4 右側の別表の定義（左表の合計・参考比率には含めない）
+COMPLETION_SIDE_TABLE = {
+    'kind': 'completion',
+    'title': '完了画面への到達',
+    'subtotal': '完了到達 小計',
+    'note': '※ 外部の予約サイト等の完了画面に到達した回数（イベント名の末尾が「完了」等）。'
+            '予約成立数ではありません。クリックの後の段階のため左表の合計に含めず、'
+            'クリック件数からも差し引いていません。',
+}
+RECRUIT_SIDE_TABLE = {
+    'kind': 'recruit',
+    'title': '求人関連イベント',
+    'subtotal': '求人関連 小計',
+    'note': '※ 求人関連: 求人応募ボタン・求人サイトへのリンク等（イベント名に「求人」「採用」'
+            '「recruit」「まいなび」等を含むもの）。左表の合計・参考比率には含めず別集計。',
+}
+UNCLASSIFIED_SIDE_TABLE = {
+    'kind': 'unclassified',
+    'title': '未分類のイベント',
+    'subtotal': '未分類 小計',
+    'note': '※ イベント名から予約・電話等と判定できなかったイベント（その他のイベント・未分類）。'
+            '左表の合計・参考比率には含めていません。',
+}
+
+
+def build_side_tables(cur_kpis: dict, prev_kpis: dict, single_mode: bool = False) -> list:
+    """P4 右側の別表（完了到達・求人関連・未分類）を作る。行が無い表は含めない。"""
+    cur_status = (cur_kpis or {}).get('key_events_status', 'missing')
+    prev_status = (prev_kpis or {}).get('key_events_status', 'missing')
+    tables = []
+    for spec, key in ((COMPLETION_SIDE_TABLE, 'key_events_completion'),
+                      (RECRUIT_SIDE_TABLE, 'key_events_recruit'),
+                      (UNCLASSIFIED_SIDE_TABLE, 'key_events_unclassified')):
+        items = side_event_items((cur_kpis or {}).get(key) or {}, (prev_kpis or {}).get(key) or {},
+                                 cur_status, prev_status, single_mode)
+        if items:
+            tables.append(dict(spec, items=items))
+    return tables
 
 
 class CompareReportCanvas:
@@ -360,29 +619,51 @@ class CompareReportCanvas:
         clr = colors.HexColor(delta_color(diff_dict['direction']))
         self._text(x, y, text, font_size=font_size, color=clr)
 
-    def _comparison_table(self, x, y, headers: list, rows: list, col_widths: list):
-        """比較テーブル描画。rows = [[cell, cell, ...], ...]"""
-        row_h = 7 * mm
+    def _comparison_table(self, x, y, headers: list, rows: list, col_widths: list,
+                          row_h=7 * mm):
+        """比較テーブル描画。rows = [[cell, cell, ...], ...]
+
+        行は dict でもよい: {'cells': [...], 'muted': True, 'span': (列番号, 文字列)}
+        muted は灰色の文字、span は指定列から右端までを1つのセルとして左寄せで描く
+        （同数のため合計から除外した行などに使う）。
+        """
         total_w = sum(col_widths)
+        text_dy = 2 * mm if row_h >= 7 * mm else 1.6 * mm
 
         for ri, row in enumerate([headers] + rows):
             row_y = y - ri * row_h
             is_header = ri == 0
+            spec = row if isinstance(row, dict) else {'cells': row}
+            cells = spec['cells']
 
             bg = COLOR_PRIMARY if is_header else \
                 (COLOR_CARD_BG if ri % 2 == 1 else colors.HexColor('#F5F8FC'))
             self.c.setFillColor(bg)
             self.c.rect(x, row_y - row_h, total_w, row_h, fill=1, stroke=0)
 
-            txt_color = COLOR_WHITE if is_header else COLOR_DARK
+            txt_color = COLOR_WHITE if is_header else (
+                COLOR_GRAY if spec.get('muted') else COLOR_DARK)
+            span_col, span_text = spec.get('span') or (None, None)
             cx = x
-            for ci, (cell, cw) in enumerate(zip(row, col_widths)):
+            for ci, (cell, cw) in enumerate(zip(cells, col_widths)):
+                if span_col is not None and ci >= span_col:
+                    break
                 align = 'right' if ci >= 1 and not is_header else 'left'
                 pad = 3 * mm if align == 'left' else -3 * mm
+                font_size = 8
+                if is_header:
+                    # 見出し（期間ラベル等）が列幅を超えて隣の列と重ならないよう縮める
+                    room = cw - 4 * mm
+                    while font_size > 5.5 and pdfmetrics.stringWidth(str(cell), JP_FONT, font_size) > room:
+                        font_size -= 0.25
                 self._text(cx + (cw + pad if align == 'right' else pad),
-                           row_y - row_h + 2 * mm, str(cell),
-                           font_size=8, color=txt_color, align=align)
+                           row_y - row_h + text_dy, str(cell),
+                           font_size=font_size, color=txt_color, align=align)
                 cx += cw
+            if span_col is not None:
+                sx = x + sum(col_widths[:span_col])
+                self._text(sx + 3 * mm, row_y - row_h + text_dy, str(span_text),
+                           font_size=7.5, color=COLOR_GRAY)
 
     def _kpi_comparison_card(self, x, y, w, h, label: str,
                              cur_val: str, prev_val: str, diff_dict: dict, unit: str = ''):
@@ -442,6 +723,11 @@ class CompareReportCanvas:
         # 比較期間
         cur_label = cur_meta.get('month_label', '')
         prev_label = prev_meta.get('month_label', '')
+        # 暦月でない期間（例 9/15〜10/12）は月名で呼ばず、年つきの期間で表示する
+        if not cur_meta.get('is_calendar_month', True) and cur_meta.get('period_label'):
+            cur_label = cur_meta['period_label']
+        if not prev_meta.get('is_calendar_month', True) and prev_meta.get('period_label'):
+            prev_label = prev_meta['period_label']
         if single_mode or (prev_label and cur_label and prev_label == cur_label):
             period_text = f'{cur_label}'
         else:
@@ -485,7 +771,7 @@ class CompareReportCanvas:
 
     def draw_summary_compare(self, cur_meta, prev_meta, cur_kpis, prev_kpis,
                              compared_kpis, daily_chart_bytes, company_name='',
-                             incomplete_note=''):
+                             incomplete_note='', single_mode: bool = False):
         """P2: KPI比較サマリ（元の単月版レイアウト準拠）"""
         self._bg(COLOR_LIGHT)
 
@@ -554,12 +840,26 @@ class CompareReportCanvas:
         self._rect(12 * mm, banner_y - 12 * mm, banner_w, 12 * mm,
                    fill_color=COLOR_PRIMARY, radius=3)
         kev_diff = compared_kpis['key_events_total']
-        if kev_diff.get('comparable') is False:
+        if kev_diff.get('incomparable_reason') == 'treatment_mismatch':
+            # 両月とも件数はあるが、合計に含めるイベントが月で異なる → 値は出し、差は出さない
+            kev_label = ('キーイベント発生回数（イベント名から判定）'
+                         if cur_kpis.get('key_events_status') == KEY_EVENTS_INFERRED
+                         else 'キーイベント発生回数')
+            banner_text = (
+                f"{kev_label}: {cur_kpis['key_events_total']:,}件 "
+                f"（前月{prev_kpis['key_events_total']:,}件 比較不能）"
+            )
+        elif kev_diff.get('comparable') is False:
             cur_text = key_events_status_text(cur_kpis)
             prev_text = key_events_status_text(prev_kpis)
-            reason = ('集計方法が異なるため比較不能'
-                      if kev_diff.get('incomparable_reason') == 'method_mismatch' else '比較不能')
-            banner_text = f'キーイベント発生回数: 当月 {cur_text} / 前月 {prev_text}（{reason}）'
+            reason = {
+                'method_mismatch': '集計方法が異なるため比較不能',
+                'breakdown_unavailable': '内訳が無いため比較不能',
+            }.get(kev_diff.get('incomparable_reason'), '比較不能')
+            if single_mode:
+                banner_text = f'キーイベント発生回数: 当月 {cur_text}'
+            else:
+                banner_text = f'キーイベント発生回数: 当月 {cur_text} / 前月 {prev_text}（{reason}）'
         else:
             kev_delta = format_delta(kev_diff)
             kev_label = ('キーイベント発生回数（イベント名から判定）'
@@ -572,37 +872,42 @@ class CompareReportCanvas:
         self._text(PAGE_W / 2, banner_y - 6 * mm, banner_text,
                    font_size=12, color=COLOR_WHITE, align='center')
 
-        # 計測期間が不完全な場合の注記（前月比は参考値）
-        chart_offset = 0
+        # バナー下の注記。いずれも行数を測って折り返し、その分グラフを下げる。
         # 1行目の注記はバナー下端（banner_y - 12mm）から文字高さ分離す。
         # -13mm だと文字の上端がバナーに隠れていた。
-        note_y = banner_y - 15 * mm
-        inferred_note = key_events_inferred_note(cur_kpis, prev_kpis)
-        if inferred_note:
-            self._text(12 * mm, note_y, inferred_note, font_size=7, color=COLOR_GRAY)
-            chart_offset += 5 * mm
-            note_y -= 4 * mm
-        # 求人関連は計測するが、バナーの合計（予約・電話等）には混ぜず別集計で示す
-        recruit_note = recruit_events_note(cur_kpis, prev_kpis)
-        if recruit_note:
-            used = self._text_wrapped(12 * mm, note_y, recruit_note,
-                                      max_width=PAGE_W - 24 * mm,
-                                      font_size=7, color=COLOR_GRAY, max_lines=2)
-            chart_offset += max(used, 1) * 4 * mm + 1 * mm
-            note_y -= max(used, 1) * 4 * mm
+        notes = []
+        fallback_note = platform_total_note(cur_kpis, prev_kpis, single_mode)
+        if fallback_note:
+            notes.append((fallback_note, colors.HexColor('#B5791F')))
+        for text in (
+            treatment_mismatch_note(cur_kpis, prev_kpis, single_mode),
+            key_events_inferred_note(cur_kpis, prev_kpis),
+            # 同数の2イベントは1つ分のみ合計に含める（同じ操作の重複計測の疑い）
+            dedupe_note_text(cur_kpis, prev_kpis, single_mode),
+            dedupe_unverified_note(cur_kpis, prev_kpis, single_mode),
+            # 完了到達（予約成立数ではない）・求人関連・未分類は合計に混ぜず別集計で示す
+            completion_events_note(cur_kpis, prev_kpis, single_mode),
+            completion_counted_note(cur_kpis, prev_kpis),
+            recruit_events_note(cur_kpis, prev_kpis, single_mode),
+            unclassified_events_note(cur_kpis, prev_kpis, single_mode),
+        ):
+            if text:
+                notes.append((text, COLOR_GRAY))
         if incomplete_note:
-            self._text(12 * mm, note_y, f'⚠ {incomplete_note}',
-                       font_size=7, color=colors.HexColor('#B5791F'))
-            chart_offset += 5 * mm
-            note_y -= 4 * mm
-
+            notes.append((f'⚠ {incomplete_note}', colors.HexColor('#B5791F')))
         # 30日アクティブユーザーの集計窓の注記（暦月と一致しない月のみ表示）
         window_note = rolling_window_note(cur_meta, prev_meta)
         if window_note:
-            used = self._text_wrapped(12 * mm, note_y, window_note,
+            notes.append((window_note, COLOR_GRAY))
+
+        chart_offset = 0
+        note_y = banner_y - 15 * mm
+        for text, clr in notes:
+            used = self._text_wrapped(12 * mm, note_y, text,
                                       max_width=PAGE_W - 24 * mm,
-                                      font_size=7, color=COLOR_GRAY, max_lines=2)
-            chart_offset += max(used, 1) * 4 * mm
+                                      font_size=7, color=clr, max_lines=2)
+            chart_offset += max(used, 1) * 3.6 * mm + 0.6 * mm
+            note_y -= max(used, 1) * 3.6 * mm + 0.6 * mm
         if chart_offset:
             chart_offset += 2 * mm  # 注記の開始位置を下げた分
 
@@ -616,12 +921,23 @@ class CompareReportCanvas:
         self._footer(company_name, 2)
 
     def draw_channels_compare(self, channel_chart_bytes, compared_channels,
-                              cur_label, prev_label, company_name=''):
+                              cur_label, prev_label, company_name='',
+                              channel_mismatch: bool = False,
+                              cur_dimension: str = '', prev_dimension: str = ''):
         """P3: チャネル比較"""
         self._bg(COLOR_LIGHT)
         self._page_title_bar('流入チャネル比較')
 
         content_top = PAGE_H - 30 * mm
+
+        if channel_mismatch:
+            names = {'channel_group': 'チャネルグループ', 'source_medium': '参照元/メディア'}
+            self._missing_data_notice(
+                12 * mm, content_top - 2 * mm, PAGE_W - 24 * mm, 10 * mm,
+                f'チャネル比較不能（当月: {names.get(cur_dimension, "不明")} / '
+                f'前月: {names.get(prev_dimension, "不明")}）。'
+                '月によって流入元の分類方法が異なるため、チャネル別の増減は比較していません。'
+            )
 
         # チャネル比較グラフ
         if channel_chart_bytes:
@@ -666,32 +982,51 @@ class CompareReportCanvas:
                                 cur_label, prev_label, company_name='',
                                 transition_rate_chart_bytes=None,
                                 cur_kpis=None, prev_kpis=None,
-                                compared_recruit=None):
+                                compared_recruit=None, side_tables=None,
+                                single_mode: bool = False):
         """P4: キーイベント発生回数とセッション比の比較。
 
-        compared_recruit: 求人関連イベントの比較結果（compare_key_events の形式）。
-            予約・電話等の表とは分けて右側に別表（求人関連 小計つき）で示す。
+        compared_kevents: 合計に入れる予約・電話等の比較結果（compare_key_events の形式）。
+        side_tables: 右側の別表 [{'kind','title','subtotal','note','items'}]。
+            完了到達・求人関連・未分類は左表の合計・参考比率に含めず、ここで別に示す。
+        compared_recruit: 互換用（side_tables が無い場合に求人関連の別表として使う）。
         """
         self._bg(COLOR_LIGHT)
         self._page_title_bar('キーイベント発生回数比較')
 
         content_top = PAGE_H - 30 * mm
         margin = 10 * mm
+        cur_kpis = cur_kpis or {}
+        prev_kpis = prev_kpis or {}
+
+        if side_tables is None:
+            side_tables = []
+            if compared_recruit:
+                side_tables.append(dict(RECRUIT_SIDE_TABLE, items=compared_recruit))
+        side_tables = [t for t in side_tables if t.get('items')]
+        has_recruit_table = any(t.get('kind') == 'recruit' for t in side_tables)
+
+        # 同数のため合計から除外したイベント（左表に残し、合計には入れない）
+        cur_status = cur_kpis.get('key_events_status', 'missing')
+        prev_status = prev_kpis.get('key_events_status', 'missing')
+        comparison_available, incomparable_reason = key_events_comparison(cur_status, prev_status)
+        excluded = compare_key_events(
+            cur_kpis.get('key_events_dedup_excluded') or {},
+            prev_kpis.get('key_events_dedup_excluded') or {},
+        ) if comparison_available else []
 
         has_kev_data = bool(compared_kevents) and any(
             (int(i.get('current', 0)) > 0 or int(i.get('previous', 0)) > 0)
             for i in compared_kevents
         )
 
-        cur_status = (cur_kpis or {}).get('key_events_status', 'missing')
-        prev_status = (prev_kpis or {}).get('key_events_status', 'missing')
-        comparison_available, incomparable_reason = key_events_comparison(cur_status, prev_status)
-
         def status_label(status):
             if status == 'missing':
                 return '未出力'
             if status == KEY_EVENTS_INFERRED:
                 return 'イベント名から判定'
+            if status == KEY_EVENTS_FALLBACK:
+                return '内訳なし（合計のみ）'
             return 'GA4のキーイベント明細'
 
         # --- 上段: 発生回数比較（左）+ セッション比（右） ---
@@ -714,30 +1049,47 @@ class CompareReportCanvas:
             self._image_bytes(kev_chart_bytes, margin, content_top - 5 * mm,
                               PAGE_W - 20 * mm, h=chart_h)
 
+        months = (f'当月: {status_label(cur_status)}' if single_mode else
+                  f'当月: {status_label(cur_status)} / 前月: {status_label(prev_status)}')
+        notice = None
         if not comparison_available and incomparable_reason == 'method_mismatch':
-            self._missing_data_notice(
-                margin + 2 * mm, content_top - 10 * mm, PAGE_W - 24 * mm, 10 * mm,
-                f'キーイベント比較不能（当月: {status_label(cur_status)} / 前月: {status_label(prev_status)}）。'
-                '集計方法が異なるため、増減を比較していません。'
-            )
+            notice = f'キーイベント比較不能（{months}）。集計方法が異なるため、増減を比較していません。'
+        elif not comparison_available and incomparable_reason == 'breakdown_unavailable':
+            notice = (f'キーイベント比較不能（{months}）。イベント別の内訳が無いため、'
+                      '件数と前月比は出していません。')
         elif not comparison_available:
-            cur_text = '未出力' if cur_status == 'missing' else '出力済み'
-            prev_text = '未出力' if prev_status == 'missing' else '出力済み'
+            notice = f'キーイベント比較不能（{months}）。未出力を0件として扱っていません。'
+        elif not has_kev_data and not excluded:
+            notice = 'キーイベント発生回数は当月・前月とも0件です。'
+        if notice:
             self._missing_data_notice(
-                margin + 2 * mm, content_top - 10 * mm, PAGE_W - 24 * mm, 10 * mm,
-                f'キーイベント比較不能（当月: {cur_text} / 前月: {prev_text}）。未出力を0件として扱っていません。'
-            )
-        elif not has_kev_data:
-            self._missing_data_notice(
-                margin + 2 * mm, content_top - 10 * mm, PAGE_W - 24 * mm, 10 * mm,
-                'キーイベント発生回数は当月・前月とも0件です。'
-            )
+                margin + 2 * mm, content_top - 10 * mm, PAGE_W - 24 * mm, 10 * mm, notice)
 
         # --- 下段: キーイベントテーブル（セッション比の参考値付き） ---
-        if compared_kevents:
+        col_ws = [42 * mm, 22 * mm, 22 * mm, 22 * mm, 22 * mm, 20 * mm, 20 * mm]
+        note_w = sum(col_ws) if side_tables else PAGE_W - 20 * mm
+        # 片方の月だけ合計から外したイベントがある場合、合計・小計の前月差は出さない
+        mismatch = ([] if (single_mode or not comparison_available)
+                    else treatment_mismatch_events(cur_kpis, prev_kpis))
+        table_notes = []
+        if compared_kevents or excluded:
+            table_notes.append(
+                '※ 参考比率 = キーイベント発生回数 ÷ セッション数。GA4のセッションCVRではなく、同一セッション内の複数回発生を含みます。'
+            )
+        for text in (
+            treatment_mismatch_note(cur_kpis, prev_kpis, single_mode),
+            key_events_inferred_note(cur_kpis, prev_kpis),
+            dedupe_note_text(cur_kpis, prev_kpis, single_mode),
+            dedupe_unverified_note(cur_kpis, prev_kpis, single_mode),
+            completion_counted_note(cur_kpis, prev_kpis),
+        ):
+            if text:
+                table_notes.append(text)
+
+        if compared_kevents or excluded:
             table_y = content_top - 72 * mm
-            cur_sessions = int(cur_kpis.get('sessions', 0)) if cur_kpis else 0
-            prev_sessions = int(prev_kpis.get('sessions', 0)) if prev_kpis else 0
+            cur_sessions = int(cur_kpis.get('sessions', 0))
+            prev_sessions = int(prev_kpis.get('sessions', 0))
 
             def reference_rate_str(event_count, sessions):
                 if sessions > 0:
@@ -745,90 +1097,95 @@ class CompareReportCanvas:
                 return '-'
 
             headers = ['イベント名', cur_label, prev_label, '増減', '増減率', '当月参考比率', '前月参考比率']
-            rows = []
-            reservation_keywords = ['予約', '電話', 'tel']
-            res_cur_total = 0
-            res_prev_total = 0
-            for item in compared_kevents:
-                if any(kw in str(item['name']).lower() for kw in reservation_keywords):
-                    res_cur_total += item['current']
-                    res_prev_total += item['previous']
+            res_cur_total = sum(i['current'] for i in compared_kevents
+                                if is_reservation_or_phone(i['name']))
+            res_prev_total = sum(i['previous'] for i in compared_kevents
+                                 if is_reservation_or_phone(i['name']))
             has_res_row = res_cur_total > 0 or res_prev_total > 0
+
+            # 同数のため合計から除外した行にも上限を設け、超過分は1行に集約する
+            excluded_shown, excluded_folded = list(excluded), []
+            if len(excluded_shown) > P4_MAX_EXCLUDED_ROWS:
+                excluded_shown = excluded[:P4_MAX_EXCLUDED_ROWS - 1]
+                excluded_folded = excluded[P4_MAX_EXCLUDED_ROWS - 1:]
 
             # イベント名から判定した月はイベント数が多くなりやすい。表がフッターに
             # 食い込まないよう、収まらない分は「その他」1行にまとめる（合計値は全件で計算）。
-            # 求人関連の別表を右に置く場合、注記は左表の幅に収めて別表と重ねない。
-            col_ws = [42 * mm, 22 * mm, 22 * mm, 22 * mm, 22 * mm, 20 * mm, 20 * mm]
-            note_w = sum(col_ws) if compared_recruit else PAGE_W - 20 * mm
-            table_notes = [
-                '※ 参考比率 = キーイベント発生回数 ÷ セッション数。GA4のセッションCVRではなく、同一セッション内の複数回発生を含みます。'
-            ]
-            inferred_note = key_events_inferred_note(cur_kpis, prev_kpis)
-            if inferred_note:
-                table_notes.append(inferred_note)
-            note_line_counts = [max(len(self._wrap_lines(n, note_w, 6.3, max_lines=2)), 1)
+            # 別表を右に置く場合、注記は左表の幅に収めて別表と重ねない。
+            note_line_counts = [max(len(self._wrap_lines(n, note_w, 6.3, max_lines=3)), 1)
                                 for n in table_notes]
             note_lines = sum(note_line_counts)
             bottom_limit = 11 * mm + note_lines * 4 * mm + 4 * mm
             max_rows = int((table_y - 5 * mm - bottom_limit) // (7 * mm)) - 1  # 見出し行を除く
-            fixed_rows = 1 + (1 if has_res_row else 0)  # 合計 + 小計
+            fixed_rows = (1 + (1 if has_res_row else 0) + len(excluded_shown)
+                          + (1 if excluded_folded else 0))  # 合計 + 小計 + 除外行
             max_event_rows = max(1, max_rows - fixed_rows)
             shown = list(compared_kevents)
             folded = []
             if len(shown) > max_event_rows:
                 shown, folded = shown[:max_event_rows - 1], shown[max_event_rows - 1:]
 
-            def event_row(name, cur_v, prev_v):
+            # 長いイベント名は列幅を実測して省略し、省略後も互いに区別できるようにする
+            name_w = col_ws[0] - 5 * mm
+            labels = shorten_labels_unique(
+                [str(i['name']) for i in shown] + [str(i['name']) for i in excluded_shown],
+                name_w, measure=lambda t: pdfmetrics.stringWidth(t, JP_FONT, 8))
+            shown_labels, excluded_labels = labels[:len(shown)], labels[len(shown):]
+
+            def event_row(name, cur_v, prev_v, comparable=True):
                 d = calc_diff(cur_v, prev_v)
                 sign = '+' if d['diff'] > 0 else ''
                 pct_str = f"{sign}{d['pct']:.1f}%" if d['pct'] is not None else 'N/A'
+                diff_str = f"{sign}{int(d['diff']):,}"
+                if not comparable:
+                    diff_str, pct_str = '比較不能', '比較不能'
                 return [
                     name,
                     f"{int(cur_v):,}",
                     f"{int(prev_v):,}",
-                    f"{sign}{int(d['diff']):,}",
+                    diff_str,
                     pct_str,
                     reference_rate_str(cur_v, cur_sessions),
                     reference_rate_str(prev_v, prev_sessions),
                 ]
 
-            for item in shown:
-                rows.append(event_row(str(item['name'])[:20], item['current'], item['previous']))
+            rows = []
+            # 片方の月だけ合計から外したイベントの行も、増減は比較不能（前月比を作らない）
+            mismatch_names = {m['name'] for m in mismatch}
+            for item, label in zip(shown, shown_labels):
+                rows.append(event_row(label, item['current'], item['previous'],
+                                      comparable=item['name'] not in mismatch_names))
             if folded:
                 rows.append(event_row(
                     f'その他（{len(folded)}種）',
                     sum(i['current'] for i in folded),
                     sum(i['previous'] for i in folded),
                 ))
+            # 同数のため合計から除外した行は件数を括弧で示し、合計・小計・参考比率に入れない
+            for item, label in zip(excluded_shown, excluded_labels):
+                rows.append({
+                    'cells': [label, f"({int(item['current']):,})", f"({int(item['previous']):,})"],
+                    'muted': True,
+                    'span': (3, '同数のため合計から除外'),
+                })
+            if excluded_folded:
+                rows.append({
+                    'cells': [f'他{len(excluded_folded)}件（合計に含めない）',
+                              f"({sum(int(i['current']) for i in excluded_folded):,})",
+                              f"({sum(int(i['previous']) for i in excluded_folded):,})"],
+                    'muted': True,
+                    'span': (3, '同数のため合計から除外'),
+                })
             # クリック・電話タップ等であり、実際の予約成立とは限らないため「アクション」と表記する。
             if has_res_row:
-                res_diff = calc_diff(res_cur_total, res_prev_total)
-                sign = '+' if res_diff['diff'] > 0 else ''
-                pct_str = f"{sign}{res_diff['pct']:.1f}%" if res_diff['pct'] is not None else 'N/A'
-                rows.append([
-                    '予約・電話アクション 小計',
-                    f"{res_cur_total:,}",
-                    f"{res_prev_total:,}",
-                    f"{sign}{int(res_diff['diff']):,}",
-                    pct_str,
-                    reference_rate_str(res_cur_total, cur_sessions),
-                    reference_rate_str(res_prev_total, prev_sessions),
-                ])
-            # 合計行（この表の内訳＝予約・電話等の和。求人関連は右の別表で小計する）
+                row = event_row('予約・電話アクション 小計', res_cur_total, res_prev_total,
+                                comparable=not mismatch)
+                rows.append(row)
+            # 合計行（左表で合計に入れたイベントの和。別表・除外行は含めない）
             total_cur = sum(i['current'] for i in compared_kevents)
             total_prev = sum(i['previous'] for i in compared_kevents)
-            total_diff = calc_diff(total_cur, total_prev)
-            sign = '+' if total_diff['diff'] > 0 else ''
-            pct_str = f"{sign}{total_diff['pct']:.1f}%" if total_diff['pct'] is not None else 'N/A'
-            rows.append([
-                '合計（求人関連を除く）' if compared_recruit else '合計',
-                f"{total_cur:,}",
-                f"{total_prev:,}",
-                f"{sign}{int(total_diff['diff']):,}",
-                pct_str,
-                reference_rate_str(total_cur, cur_sessions),
-                reference_rate_str(total_prev, prev_sessions),
-            ])
+            rows.append(event_row('合計（求人関連を除く）' if has_recruit_table else '合計',
+                                  total_cur, total_prev, comparable=not mismatch))
 
             self._comparison_table(margin, table_y - 5 * mm, headers, rows, col_ws)
             # 表は table_y - 5mm から描くため、下端はその分も差し引く
@@ -840,72 +1197,98 @@ class CompareReportCanvas:
                     max_width=note_w,
                     font_size=6.3,
                     color=COLOR_GRAY,
-                    max_lines=2,
+                    max_lines=3,
                 )
                 note_y -= n_lines * 4 * mm
         else:
-            # 比較不能でも、イベント名から判定した月があることは明示する
-            inferred_note = key_events_inferred_note(cur_kpis, prev_kpis)
-            if inferred_note:
-                self._text_wrapped(
-                    margin + 2 * mm, content_top - 25 * mm, inferred_note,
-                    max_width=PAGE_W - 24 * mm, font_size=7,
-                    color=COLOR_GRAY, max_lines=2,
+            # 比較不能でも、イベント名から判定した月・同数の除外があることは明示する
+            note_y = content_top - 25 * mm
+            for note in table_notes:
+                used = self._text_wrapped(
+                    margin + 2 * mm, note_y, note,
+                    max_width=note_w - 2 * mm, font_size=7,
+                    color=COLOR_GRAY, max_lines=3,
                 )
+                note_y -= max(used, 1) * 4 * mm
 
-        # --- 右下: 求人関連（別カテゴリ）。予約・電話等の合計・参考比率には含めない ---
-        if compared_recruit:
-            self._draw_recruit_events_table(compared_recruit, cur_label, prev_label,
-                                            x=margin + 176 * mm,
-                                            y=content_top - 72 * mm - 5 * mm)
+        # --- 右下: 完了到達・求人関連・未分類（別カテゴリ）。左表の合計・参考比率には含めない ---
+        if side_tables:
+            self._draw_side_tables(side_tables, cur_label, prev_label,
+                                   x=margin + 176 * mm, y=content_top - 72 * mm - 5 * mm,
+                                   bottom=P4_BOTTOM_LIMIT)
 
         self._footer(company_name, 4)
 
-    def _draw_recruit_events_table(self, compared_recruit, cur_label, prev_label, x, y):
-        """求人関連イベントの別表（行＋「求人関連 小計」）と注記を描く。"""
+    def _side_note_lines(self, table, width):
+        return max(len(self._wrap_lines(table['note'], width, 6.3, max_lines=3)), 1)
+
+    def _draw_side_tables(self, tables, cur_label, prev_label, x, y, bottom):
+        """右側の別表を、先に全表の高さを割り当ててから描く（後の表がフッターに落ちないように）。
+
+        各表は見出し・小計・注記の高さを確保し、残りの行を表どうしで分け合う。
+        割り当てを超える行は「他N件（小計に含む）」の1行に集約する。
+        全表に1行も割り当てられない場合は、表をやめて件数を文章で示す（前月値も残す）。
+        """
+        width = PAGE_W - 10 * mm - x
+        gap = 3 * mm
+        for row_h in (7 * mm, 6 * mm, 5.2 * mm, 4.6 * mm):
+            # 見出し＋小計の2行、表と注記の間 4mm、注記（行数を実測）、注記の下端 1.5mm、表どうしの間
+            fixed = [2 * row_h + 4 * mm + (self._side_note_lines(t, width) - 1) * 3.2 * mm
+                     + 1.5 * mm + gap for t in tables]
+            capacity = int((y - bottom - sum(fixed) + gap) // row_h)
+            alloc = allocate_side_rows([len(t['items']) for t in tables], capacity)
+            if alloc is not None:
+                for table, rows_n in zip(tables, alloc):
+                    y = self._draw_side_table(table, cur_label, prev_label, x, y,
+                                              row_h=row_h, max_event_rows=rows_n)
+                    y -= gap
+                return
+        # 表として収まらない: 各別表の小計を文章で示す（前月値・比較不能も落とさない）
+        for table in tables:
+            used = self._text_wrapped(x, y - 3 * mm, side_table_summary_text(table, cur_label, prev_label),
+                                      max_width=width, font_size=6.3, color=COLOR_GRAY, max_lines=4)
+            y -= max(used, 1) * 3.2 * mm + 2 * mm
+
+    def _draw_side_table(self, table, cur_label, prev_label, x, y, row_h=7 * mm,
+                         max_event_rows=None):
+        """別表（行＋小計）と注記を描き、注記の下端の y を返す。
+
+        比較できない月の行（previous が None）は、前月を「未出力」等、増減を「比較不能」とする。
+        max_event_rows を超える行は「他N件（小計に含む）」の1行にまとめる。
+        """
+        items = list(table['items'])
         width = PAGE_W - 10 * mm - x
         col_ws = [width - 54 * mm, 18 * mm, 18 * mm, 18 * mm]
-        # 表と注記がフッターに食い込まない行数に抑える（超過分は「その他」に集約）
-        note_h = 3 * 3.2 * mm
-        max_rows = int((y - 12 * mm - note_h) // (7 * mm)) - 1  # 見出し行を除く
-        max_event_rows = max(1, max_rows - 1)  # 小計行を除く
-        shown = list(compared_recruit)
-        folded = []
-        if len(shown) > max_event_rows:
-            shown, folded = shown[:max_event_rows - 1], shown[max_event_rows - 1:]
+        note_lines = self._side_note_lines(table, width)
+        shown, folded = fold_items(items, max_event_rows if max_event_rows is not None else len(items))
 
         name_w = col_ws[0] - 4 * mm
-
-        def fit(name):
-            name = str(name)
-            if pdfmetrics.stringWidth(name, JP_FONT, 8) <= name_w:
-                return name
-            while name and pdfmetrics.stringWidth(name + '…', JP_FONT, 8) > name_w:
-                name = name[:-1]
-            return name + '…'
+        labels = shorten_labels_unique([str(i['name']) for i in shown], name_w,
+                                       measure=lambda t: pdfmetrics.stringWidth(t, JP_FONT, 8))
+        incomparable = any(i.get('previous') is None for i in items)
+        prev_text = next((i.get('prev_text') for i in items if i.get('previous') is None), '—')
 
         def row(name, cur_v, prev_v):
+            if incomparable:
+                return [name, f'{int(cur_v):,}', prev_text, '比較不能']
             d = int(cur_v) - int(prev_v)
             sign = '+' if d > 0 else ''
-            return [fit(name), f'{int(cur_v):,}', f'{int(prev_v):,}', f'{sign}{d:,}']
+            return [name, f'{int(cur_v):,}', f'{int(prev_v):,}', f'{sign}{d:,}']
 
-        rows = [row(i['name'], i['current'], i['previous']) for i in shown]
+        rows = [row(lab, i['current'], i.get('previous') or 0) for lab, i in zip(labels, shown)]
         if folded:
-            rows.append(row(f'その他（{len(folded)}種）',
+            rows.append(row(f'他{len(folded)}件（小計に含む）',
                             sum(i['current'] for i in folded),
-                            sum(i['previous'] for i in folded)))
-        rows.append(row('求人関連 小計',
-                        sum(i['current'] for i in compared_recruit),
-                        sum(i['previous'] for i in compared_recruit)))
-        self._comparison_table(x, y, ['求人関連イベント', cur_label, prev_label, '増減'],
-                               rows, col_ws)
-        note_y = y - (len(rows) + 1) * 7 * mm - 4 * mm
-        self._text_wrapped(
-            x, note_y,
-            '※ 求人関連: 求人応募ボタン・求人サイトへのリンク等（イベント名に「求人」「採用」'
-            '「recruit」「まいなび」等を含むもの）。左表の合計・参考比率には含めず別集計。',
-            max_width=width, font_size=6.3, color=COLOR_GRAY, max_lines=3,
-        )
+                            sum((i.get('previous') or 0) for i in folded)))
+        rows.append(row(table['subtotal'],
+                        sum(i['current'] for i in items),
+                        sum((i.get('previous') or 0) for i in items)))
+        self._comparison_table(x, y, [table['title'], cur_label, prev_label, '増減'],
+                               rows, col_ws, row_h=row_h)
+        note_y = y - (len(rows) + 1) * row_h - 4 * mm
+        self._text_wrapped(x, note_y, table['note'],
+                           max_width=width, font_size=6.3, color=COLOR_GRAY, max_lines=3)
+        return note_y - (note_lines - 1) * 3.2 * mm - 1 * mm
 
     def draw_pages_compare(self, pages_chart_bytes, cur_pages, prev_pages, company_name=''):
         """P5: 上位ページ比較（20件テーブル）"""
@@ -1177,7 +1560,8 @@ class CompareReportCanvas:
     def draw_summary_page(self, highlights: dict, cur_meta: dict, prev_meta: dict,
                           company_name='', page_num=7, single_mode: bool = False,
                           cur_kpis: dict | None = None,
-                          country_note: str = '', incomplete_note: str = ''):
+                          country_note: str = '', incomplete_note: str = '',
+                          prev_kpis: dict | None = None):
         """P7: 総括"""
         self._bg(COLOR_LIGHT)
         self._page_title_bar('月次比較 総括')
@@ -1190,7 +1574,8 @@ class CompareReportCanvas:
             self._text(
                 margin,
                 content_top,
-                f"対象月: {cur_meta.get('month_label', '')}",
+                (f"対象月: {cur_meta.get('month_label', '')}" if cur_meta.get('is_calendar_month', True)
+                 else f"対象期間: {cur_meta.get('period_label') or cur_meta.get('month_label', '')}"),
                 font_size=12,
                 color=COLOR_DARK,
             )
@@ -1321,6 +1706,9 @@ class CompareReportCanvas:
 
             if key_events_status == 'missing':
                 key_event_comment = 'キーイベント明細はCSVに未出力のため、発生回数は評価できません。'
+            elif key_events_status == KEY_EVENTS_FALLBACK:
+                key_event_comment = ('キーイベントのイベント別の内訳が出力されていないため、'
+                                     '予約・電話などの発生回数は算出していません。')
             elif key_events_status == KEY_EVENTS_INFERRED:
                 key_event_comment = f'イベント名から判定した予約・電話などの発生回数は合計 {key_events_total:,} 件でした。'
             else:
@@ -1332,6 +1720,12 @@ class CompareReportCanvas:
             single_comments = [
                 f"今月のアクセス数は {sessions:,} 件、アクティブユーザーは {active_users:,} 人でした。",
                 f"新しく来訪したユーザーは {new_users:,} 人でした。{key_event_comment}",
+            ]
+            # 同数の2イベントは1つ分のみ合計に含めた旨（平易な文で）
+            dedupe_txt = dedupe_note_text(kpis, kpis, single_mode=True, with_mark=False)
+            if dedupe_txt:
+                single_comments.append(dedupe_txt)
+            single_comments += [
                 f"アクティブユーザーあたりの平均エンゲージメント時間は {kpis.get('avg_engage_str', '-')}でした。",
                 "次月は、成果につながったページの見出しと導線を優先的に整え、予約ボタン周辺の文言を統一して改善を進めることを推奨します。",
             ]
@@ -1383,15 +1777,28 @@ class CompareReportCanvas:
             right_bottom = ay - 2 * mm
         else:
             right_bottom = ay - 5 * mm - max(action_lines, 1) * 3.4 * mm
-        note_y = min(left_bottom, right_bottom) - 10 * mm
+        # 下部の注記。行数を先に測り、フッター線より上に収まるよう開始位置を決める。
+        notes = []
         if incomplete_note:
-            self._text(margin, note_y, f'⚠ {incomplete_note}',
-                       font_size=7, color=colors.HexColor('#B5791F'))
-            note_y -= 4.5 * mm
-        self._text_wrapped(margin, note_y,
-                           country_note or '※ 本レポートはGA4エクスポートCSVに基づいています。',
-                           max_width=PAGE_W - 2 * margin,
-                           font_size=7, color=COLOR_GRAY, max_lines=3)
+            notes.append((f'⚠ {incomplete_note}', colors.HexColor('#B5791F'), 1))
+        if not single_mode:
+            # キーイベントの合計に1つ分のみ含めた同数イベント（同じ操作の重複計測の疑い）
+            dedupe_txt = dedupe_note_text(cur_kpis, prev_kpis)
+            if dedupe_txt:
+                notes.append((dedupe_txt, COLOR_GRAY, 2))
+        notes.append((country_note or '※ 本レポートはGA4エクスポートCSVに基づいています。',
+                      COLOR_GRAY, 3))
+        note_w = PAGE_W - 2 * margin
+        line_h = 3.6 * mm
+        heights = [max(len(self._wrap_lines(t, note_w, 7, max_lines=ml)), 1) * line_h + 0.6 * mm
+                   for t, _, ml in notes]
+        upper = min(left_bottom, right_bottom) - 4 * mm   # 上の段と重ならない最も高い位置
+        lowest_start = 12 * mm + sum(heights) - line_h    # 最終行がフッター線より上に来る開始位置
+        note_y = min(upper, max(min(left_bottom, right_bottom) - 10 * mm, lowest_start))
+        for (text, clr, ml), h in zip(notes, heights):
+            self._text_wrapped(margin, note_y, text, max_width=note_w,
+                               font_size=7, color=clr, max_lines=ml)
+            note_y -= h
 
         self._footer(company_name, page_num)
 
@@ -1601,7 +2008,7 @@ class CompareReportCanvas:
         left_w = 165 * mm
         right_w = PAGE_W - (margin * 2) - left_w - 6 * mm
         has_res_data = bool(compared_kevents) and any(
-            any(kw in str(i.get('name', '')).lower() for kw in ['予約', '電話', 'tel'])
+            is_reservation_or_phone(i.get('name', ''))
             and (int(i.get('current', 0)) > 0 or int(i.get('previous', 0)) > 0)
             for i in compared_kevents
         )
@@ -1626,9 +2033,7 @@ class CompareReportCanvas:
         table_y = content_top - 72 * mm
         self._section_header(margin, table_y, '予約・電話イベント詳細')
 
-        reservation_keywords = ['予約', '電話', 'tel']
-        res_events = [e for e in compared_kevents
-                      if any(kw in str(e['name']).lower() for kw in reservation_keywords)]
+        res_events = [e for e in compared_kevents if is_reservation_or_phone(e['name'])]
         if not res_events:
             res_events = compared_kevents  # フォールバック
 
@@ -1778,6 +2183,20 @@ class CompareReportCanvas:
         prev_web_new_share = (prev_paid_new['web'] / prev_total_new * 100) if prev_total_new > 0 else 0
         cur_sns_new_share = (cur_paid_new['sns'] / cur_total_new * 100) if cur_total_new > 0 else 0
         prev_sns_new_share = (prev_paid_new['sns'] / prev_total_new * 100) if prev_total_new > 0 else 0
+        # 参照元/メディア別の代替表は「アクティブユーザー」であり新規ユーザーではない。
+        # 新規ユーザーの代わりには使わず、取得不能と表示する。
+        cur_new_ok = cur_data.get('ch_new_metric', 'new_users') == 'new_users'
+        prev_new_ok = prev_data.get('ch_new_metric', 'new_users') == 'new_users'
+        na_new = '取得不能（チャネル別の新規ユーザーなし）'
+
+        def new_share_row(label, kind, cur_share, prev_share):
+            cur_txt = (f'{cur_share:.2f}% ({cur_paid_new[kind]:,}/{cur_total_new:,})'
+                       if cur_new_ok else na_new)
+            prev_txt = (f'{prev_share:.2f}% ({prev_paid_new[kind]:,}/{prev_total_new:,})'
+                        if prev_new_ok else na_new)
+            diff_txt = f'{cur_share - prev_share:+.2f}pt' if (cur_new_ok and prev_new_ok) else '—'
+            return [label, cur_txt, prev_txt, diff_txt]
+
         rows = [
             [
                 'Web広告 セッション比率',
@@ -1791,18 +2210,8 @@ class CompareReportCanvas:
                 f'{prev_sns_ses_share:.2f}% ({prev_paid_ses["sns"]:,}/{prev_total_ses:,})',
                 f'{cur_sns_ses_share - prev_sns_ses_share:+.2f}pt',
             ],
-            [
-                'Web広告 新規ユーザー比率',
-                f'{cur_web_new_share:.2f}% ({cur_paid_new["web"]:,}/{cur_total_new:,})',
-                f'{prev_web_new_share:.2f}% ({prev_paid_new["web"]:,}/{prev_total_new:,})',
-                f'{cur_web_new_share - prev_web_new_share:+.2f}pt',
-            ],
-            [
-                'SNS広告 新規ユーザー比率',
-                f'{cur_sns_new_share:.2f}% ({cur_paid_new["sns"]:,}/{cur_total_new:,})',
-                f'{prev_sns_new_share:.2f}% ({prev_paid_new["sns"]:,}/{prev_total_new:,})',
-                f'{cur_sns_new_share - prev_sns_new_share:+.2f}pt',
-            ],
+            new_share_row('Web広告 新規ユーザー比率', 'web', cur_web_new_share, prev_web_new_share),
+            new_share_row('SNS広告 新規ユーザー比率', 'sns', cur_sns_new_share, prev_sns_new_share),
             [
                 '広告経由 CV / CVR / 広告費 *',
                 '取得不能（GA4に含まれず）',
@@ -1819,10 +2228,25 @@ class CompareReportCanvas:
             cur_kpis.get('key_events_status') == 'missing'
             or prev_kpis.get('key_events_status') == 'missing'
         )
-        key_events_zero = (
-            not key_events_missing and cur_total_cv == 0 and prev_total_cv == 0
+        # プラットフォーム合計しか無い月は、内訳が空でも0件ではない（内訳取得不能）
+        key_events_no_breakdown = not key_events_missing and (
+            cur_kpis.get('key_events_status') == KEY_EVENTS_FALLBACK
+            or prev_kpis.get('key_events_status') == KEY_EVENTS_FALLBACK
         )
-        if key_events_missing:
+        key_events_zero = (
+            not key_events_missing and not key_events_no_breakdown
+            and cur_total_cv == 0 and prev_total_cv == 0
+        )
+        if key_events_no_breakdown:
+            used = self._text_wrapped(
+                margin, note_y,
+                '⚠ キーイベントのイベント別の内訳がCSVに含まれていないため、予約・電話アクションの件数は'
+                '算出していません（0件ではありません）。',
+                max_width=PAGE_W - margin * 2,
+                font_size=6.5, color=colors.HexColor('#B5791F'), max_lines=2,
+            )
+            note_y -= max(used, 1) * 4.5 * mm
+        elif key_events_missing:
             used = self._text_wrapped(
                 margin, note_y,
                 '⚠ キーイベント明細がCSVに未出力です。0件とは判定せず、発生回数の比較を行っていません。',
@@ -1987,11 +2411,21 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
     # 2. 差分計算
     compared_kpis = compare_kpis(cur_kpis, prev_kpis)
 
-    compared_channels = compare_dataframes(
-        cur_data['df_ch_ses'], prev_data['df_ch_ses'],
-        cur_data['df_ch_ses'].columns[0] if cur_data['df_ch_ses'] is not None else 'channel',
-        cur_data['df_ch_ses'].columns[1] if cur_data['df_ch_ses'] is not None else 'value',
-    ) if cur_data['df_ch_ses'] is not None or prev_data['df_ch_ses'] is not None else pd.DataFrame()
+    # チャネルの分類方法（チャネルグループ / 参照元・メディア）が月ごとに違う場合は比較しない
+    # （列名が違うと KeyError になり、同名でも別の分類を前月比として並べることになるため）
+    channel_mismatch = (
+        not single_mode
+        and cur_data['df_ch_ses'] is not None and prev_data['df_ch_ses'] is not None
+        and cur_data.get('ch_ses_dimension') != prev_data.get('ch_ses_dimension')
+    )
+    if channel_mismatch:
+        compared_channels = pd.DataFrame()
+    else:
+        compared_channels = compare_dataframes(
+            cur_data['df_ch_ses'], prev_data['df_ch_ses'],
+            cur_data['df_ch_ses'].columns[0] if cur_data['df_ch_ses'] is not None else 'channel',
+            cur_data['df_ch_ses'].columns[1] if cur_data['df_ch_ses'] is not None else 'value',
+        ) if cur_data['df_ch_ses'] is not None or prev_data['df_ch_ses'] is not None else pd.DataFrame()
 
     key_events_comparable, _ = key_events_comparison(
         cur_kpis.get('key_events_status'), prev_kpis.get('key_events_status'))
@@ -1999,17 +2433,16 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
         cur_kpis.get('key_events', {}),
         prev_kpis.get('key_events', {}),
     ) if key_events_comparable else []
-    # 求人関連（別カテゴリ）。予約・電話等とは別表・別集計で示す
-    compared_recruit = compare_key_events(
-        cur_kpis.get('key_events_recruit', {}),
-        prev_kpis.get('key_events_recruit', {}),
-    ) if key_events_comparable else []
+    # 完了到達・求人関連・未分類（別カテゴリ）。予約・電話等とは別表・別集計で示す。
+    # 前月が比較できない場合も当月の明細は表示し、増減だけ「比較不能」にする。
+    side_tables = build_side_tables(cur_kpis, prev_kpis, single_mode)
+    compared_recruit = next((t['items'] for t in side_tables if t['kind'] == 'recruit'), [])
 
     # 3. チャート生成
     daily_chart = make_daily_overlay_chart(
         cur_data['df_active'], prev_data['df_active'], cur_label, prev_label)
 
-    channel_chart = make_channel_grouped_bar(
+    channel_chart = None if channel_mismatch else make_channel_grouped_bar(
         cur_data['df_ch_ses'], prev_data['df_ch_ses'], cur_label, prev_label)
 
     kev_chart = make_key_events_grouped_bar(
@@ -2044,6 +2477,7 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
         int(prev_kpis.get('sessions', 0)),
         cur_label,
         prev_label,
+        show_diff=compared_kpis['key_events_total'].get('incomparable_reason') != 'treatment_mismatch',
     ) if key_events_comparable else None
     paid_channel_chart = make_paid_channels_grouped_bar(
         cur_data.get('df_ch_ses'),
@@ -2077,12 +2511,15 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
     # P2: KPI比較サマリ
     rc.draw_summary_compare(cur_meta, prev_meta, cur_kpis, prev_kpis,
                             compared_kpis, daily_chart, company_name,
-                            incomplete_note=incomplete_note)
+                            incomplete_note=incomplete_note, single_mode=single_mode)
     rc.new_page()
 
     # P3: チャネル比較
     rc.draw_channels_compare(channel_chart, compared_channels,
-                             cur_label, prev_label, company_name)
+                             cur_label, prev_label, company_name,
+                             channel_mismatch=channel_mismatch,
+                             cur_dimension=cur_data.get('ch_ses_dimension'),
+                             prev_dimension=prev_data.get('ch_ses_dimension'))
     rc.new_page()
 
     # P4: キーイベント比較 + 移行率
@@ -2090,7 +2527,7 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
                                cur_label, prev_label, company_name,
                                transition_rate_chart_bytes=transition_rate_chart,
                                cur_kpis=cur_kpis, prev_kpis=prev_kpis,
-                               compared_recruit=compared_recruit)
+                               side_tables=side_tables, single_mode=single_mode)
     rc.new_page()
 
     # P5: ページ比較
@@ -2147,6 +2584,7 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
             page_num=10,
             single_mode=single_mode,
             cur_kpis=cur_kpis,
+            prev_kpis=prev_kpis,
             country_note=country_note,
             incomplete_note=incomplete_note,
         )
@@ -2181,6 +2619,7 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
             page_num=8,
             single_mode=single_mode,
             cur_kpis=cur_kpis,
+            prev_kpis=prev_kpis,
             country_note=country_note,
             incomplete_note=incomplete_note,
         )

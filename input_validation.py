@@ -1,7 +1,9 @@
 """GA4 CSV input validation for the Streamlit app."""
 
-from csv_merge import CsvMergeError, merge_ga4_csvs
-from csv_parser import parse_ga4_csv
+import hashlib
+
+from csv_merge import CsvMergeError, merge_ga4_csvs_with_notes
+from csv_parser import parse_ga4_csv, parse_yyyymmdd
 
 
 # GA4の画面名（不足項目ごとに「どこから出力すれば揃うか」を示す）
@@ -29,11 +31,37 @@ def missing_report_sections(data: dict) -> list[tuple[str, str]]:
     ]
 
 
+def meta_errors(meta: dict) -> list[str]:
+    """プロパティ・開始日・終了日の存在と、開始日≦終了日を検査する（ファイル数によらず）。"""
+    problems = []
+    if not meta.get("property") and meta.get("property_line"):
+        return ["プロパティ名が空です。GA4のレポート画面からエクスポートしたCSVか確認してください。"]
+    if not meta.get("property"):
+        problems.append("プロパティ")
+    start = parse_yyyymmdd(meta.get("start", ""))
+    end = parse_yyyymmdd(meta.get("end", ""))
+    if not start:
+        problems.append("開始日")
+    if not end:
+        problems.append("終了日")
+    errors = []
+    if problems:
+        errors.append(
+            "・".join(problems) + "が読み取れません。GA4のレポート画面からエクスポートしたCSVか確認してください。"
+        )
+    elif start > end:
+        errors.append(f"開始日({meta.get('start')})が終了日({meta.get('end')})より後になっています。")
+    return errors
+
+
 def validate_report_data(data: dict, label: str) -> list[str]:
     """Return blocking errors when a parsed CSV cannot produce a valid report."""
     errors = []
     source_report = data.get("meta", {}).get("source_report", "")
     missing = missing_report_sections(data)
+
+    for err in meta_errors(data.get("meta", {})):
+        errors.append(f"{label}: {err}")
 
     # 集客サマリーは他のCSV（エンゲージメントの概要など）と組み合わせれば必要項目が揃う。
     # 結合後も不足がある場合だけ、出力元を案内する。
@@ -50,6 +78,10 @@ def validate_report_data(data: dict, label: str) -> list[str]:
             "不足項目を0件として扱うと誤った比較になるため、PDFは生成できません。"
         )
 
+    # 数値の欠損・複数ファイル間の表の不一致・日付のずれ（csv_parser が記録）
+    for issue in data.get("issues") or []:
+        errors.append(f"{label}: {issue}")
+
     return errors
 
 
@@ -57,7 +89,7 @@ def merge_inputs(source, label: str, names=None):
     """複数ファイル指定なら1セットに結合して (bytes, errors) を返す。単一ならそのまま返す。"""
     if isinstance(source, (list, tuple)):
         try:
-            return merge_ga4_csvs(source, names=names), []
+            return merge_ga4_csvs_with_notes(source, names=names)[0], []
         except CsvMergeError as exc:
             return None, [f"{label}: {exc}"]
     return source, []
@@ -108,3 +140,20 @@ def validate_csv_inputs(cur_input, prev_input=None, cur_names=None, prev_names=N
             )
 
     return errors
+
+
+def input_signature(*parts) -> str:
+    """アップロード内容・医院名・モード等の入力署名（app.py が保存済みPDFの無効化に使う）。
+
+    保存済みのPDFが、いま画面に指定されている入力から作ったものかを判定する。
+    （A医院のPDFを作った後にB医院のCSVへ差し替えても、A医院のPDFが表示され続けていた）
+    bytes は内容のハッシュ、それ以外は文字列として順序つきで連結する。
+    """
+    h = hashlib.sha256()
+    for part in parts:
+        if isinstance(part, (bytes, bytearray)):
+            h.update(b'B' + hashlib.sha256(bytes(part)).digest())
+        else:
+            h.update(b'S' + str(part).encode('utf-8'))
+        h.update(b'\x00')
+    return h.hexdigest()

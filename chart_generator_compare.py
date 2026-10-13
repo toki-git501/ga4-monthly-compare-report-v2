@@ -12,6 +12,9 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import os
+
+from compare_utils import shorten_labels_unique
+from event_classify import is_reservation_or_phone
 # 日本語フォント: リポジトリ同梱の ipaexg.ttf を直接登録する
 from matplotlib import font_manager as _fm
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -149,10 +152,9 @@ def key_events_chart_items(cur_kev, prev_kev, top_n: int = KEY_EVENTS_CHART_TOP_
         rows = rows[:top_n] + [(f'その他（{len(rest)}種）',
                                 sum(r[1] for r in rest), sum(r[2] for r in rest))]
 
-    def short(name):
-        name = str(name)
-        return name if len(name) <= KEY_EVENTS_LABEL_MAX else name[:KEY_EVENTS_LABEL_MAX - 1] + '…'
-    return [(short(k), c, p) for k, c, p in rows]
+    # 先頭が同じ長い名前でも省略後に区別できるようにする（v9）
+    labels = shorten_labels_unique([k for k, _, _ in rows], KEY_EVENTS_LABEL_MAX)
+    return [(lab, c, p) for lab, (_, c, p) in zip(labels, rows)]
 
 
 def make_key_events_grouped_bar(cur_kev, prev_kev, cur_label: str, prev_label: str,
@@ -383,12 +385,10 @@ def make_reservation_compare_chart(cur_kev, prev_kev, cur_label: str, prev_label
                                    width_inch=8, height_inch=4) -> bytes:
     """予約・電話アクション（キーイベント）比較チャート。"""
     # 予約・電話系のイベントを抽出
-    reservation_keywords = ['予約', '電話', 'tel', 'TEL']
-
     def filter_reservations(kev_dict):
         result = {}
         for k, v in kev_dict.items():
-            if any(kw in str(k).lower() for kw in ['予約', '電話', 'tel']):
+            if is_reservation_or_phone(k):
                 result[k] = v
         if not result:
             result = kev_dict  # フォールバック: 全件
@@ -453,14 +453,17 @@ def make_reservation_transition_rate_chart(
     prev_label: str,
     width_inch=4.4,
     height_inch=3.0,
+    show_diff: bool = True,
 ) -> bytes:
-    """予約・電話アクション発生回数 / セッションの参考比率。"""
+    """予約・電話アクション発生回数 / セッションの参考比率。
+
+    show_diff=False: 合計に含めるイベントが月で異なる場合など、前月との差分を書かない。
+    """
 
     def reservation_total(kev_dict):
         total = 0
         for name, count in kev_dict.items():
-            key = str(name).lower()
-            if '予約' in key or '電話' in key or 'tel' in key:
+            if is_reservation_or_phone(name):
                 total += int(count)
         return total
 
@@ -519,10 +522,13 @@ def make_reservation_transition_rate_chart(
     # 差分注記
     sign = '+' if rate_diff > 0 else ''
     diff_color = MPL_INCREASE if rate_diff > 0 else MPL_DECREASE if rate_diff < 0 else '#8A9BB0'
+    diff_text = f'差分: {sign}{rate_diff:.2f}pt' if show_diff else '差分: 比較不能'
+    if not show_diff:
+        diff_color = '#8A9BB0'
     ax.text(
         0.98,
         0.96,
-        f'差分: {sign}{rate_diff:.2f}pt',
+        diff_text,
         transform=ax.transAxes,
         ha='right',
         va='top',

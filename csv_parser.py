@@ -2,12 +2,34 @@
 # -*- coding: utf-8 -*-
 """
 GA4 CSVパーサー — report_logic.py の parse_ga4_csv() を抽出
+
+v9〜:
+- 必須表のセルが `-`・空欄・数値に変換できない値なら、0に置き換えず `issues` に記録する
+  （input_validation が生成を止める）
+- 同じ表が複数のファイルにある場合は値の一致を確かめ、一致しなければ `issues` に記録する
+  （先勝ちで黙って選ばない。別ファイルの同じ表を合算もしない）
+- イベントの分類は event_classify.classify_event_counts() に集約（完了到達・未分類・
+  同数イベントの二重計測の疑いを分けて保持する）
 """
 
-import re
+import calendar
+import datetime as _dt
 import io
-import pandas as pd
+import math
+import re
+
 import numpy as np
+import pandas as pd
+
+from event_classify import (
+    DISPLAY_NAME_MAP,
+    RECRUIT_PATTERNS,
+    SYSTEM_EVENTS,
+    aggregate_event_rows,
+    classify_event_counts,
+    is_recruit_event,  # noqa: F401  （互換のため再公開）
+)
+
 
 def _decode_text(filepath_or_bytes) -> str:
     """Accept str path / bytes / file-like and decode robustly."""
@@ -44,42 +66,30 @@ def _to_numeric_series(series: pd.Series) -> pd.Series:
 
 
 # ─────────────────────────────────────────────────────
-# キーイベント発生回数の集計ルール
-# 合計・比較表・グラフはすべて extract_cv_events() の結果を使う（単一ソース）
+# キーイベント発生回数の集計ルール（実体は event_classify.py）
+# 合計・比較表・グラフはすべて classify_event_counts() の結果を使う（単一ソース）
 # ─────────────────────────────────────────────────────
-# GA4の自動収集・システム系イベント（患者の成果行動ではないため集計から除外）
-CV_EXCLUDE_EXACT = {
-    'tap', 'click', 'scroll', 'page_view', 'session_start', 'first_visit',
-    'user_engagement', 'view_search_results', 'file_download', 'download',
-    'video_start', 'video_progress', 'video_complete',
-    'form_start', 'view_promotion', 'select_promotion',
-}
-# 求人関連イベントの名称パターン。
-# v8〜: 計測対象に含めるが、予約・電話等の患者アクションとは別カテゴリ
-# （key_events_recruit）として集計し、予約・電話アクションの合計・参考比率には混ぜない。
-# 「まいなびリンク_top」等の求人サイトへのリンクも求人関連として扱う。
-CV_RECRUIT_PATTERNS = ('求人', '採用', 'recruit', 'saiyo', 'まいなび', 'マイナビ', 'mynavi')
+CV_EXCLUDE_EXACT = SYSTEM_EVENTS
+CV_RECRUIT_PATTERNS = RECRUIT_PATTERNS
 # 互換用の別名（v7まではこのパターンを患者コンバージョンから除外していた）
 CV_EXCLUDE_PATTERNS = CV_RECRUIT_PATTERNS
-
-# 既知イベントの表示名（未知のイベントは元の名称のまま表示する）
-CV_DISPLAY_NAME_MAP = {
-    'web予約':                          'WEB予約',
-    'web予約_sp小児ページ':              'WEB予約（小児SP）',
-    '小児web予約_sp固定タブ_':            'WEB予約（小児タブ）',
-    '成人電話':                          '電話（成人）',
-    '小児電話':                          '電話（小児）',
-    '小児電話_小児ページからのアクセス_':    '電話（小児ページ）',
-    'スマホ_tel':                        '電話（スマホ）',
-    '問診票_成人':                       '問診票（成人）',
-    '問診票ダウンロード_成人_':            '問診票DL（成人）',
-    '問診票_小児':                       '問診票（小児）',
-}
-
+CV_DISPLAY_NAME_MAP = DISPLAY_NAME_MAP
 
 # キーイベント状態: GA4のキーイベント明細が無く、イベント名から候補を判定したもの
 KEY_EVENTS_INFERRED = 'event_name_inferred'
 KEY_EVENTS_INFERRED_NOTE = 'GA4のキーイベント設定は出力に含まれないため、イベント名から判定'
+# プラットフォーム別の合計だけがあり、イベント別の内訳が無い状態
+KEY_EVENTS_FALLBACK = 'fallback'
+# イベント別の内訳がある（0件を含む）状態
+KEY_EVENTS_BREAKDOWN_STATUSES = ('available', KEY_EVENTS_INFERRED, 'configured_zero')
+
+# 複数CSVを結合した入力で、各ファイルの見出しに入るファイル名の行（csv_merge が付ける）
+FILE_MARKER_PREFIX = '# 入力ファイル:'
+
+
+def has_event_breakdown(status) -> bool:
+    """イベント別の内訳がある（合計・求人・完了到達などを数えられる）状態か。"""
+    return status in KEY_EVENTS_BREAKDOWN_STATUSES
 
 
 def _is_event_inference_source(title: str) -> bool:
@@ -88,48 +98,18 @@ def _is_event_inference_source(title: str) -> bool:
     return t == 'エンゲージメントの概要' or t.startswith('イベント')
 
 
-def is_recruit_event(name) -> bool:
-    """求人関連イベント（求人応募ボタン・求人サイトへのリンク等）か。"""
-    low = str(name).strip().lower()
-    return any(p in low for p in CV_RECRUIT_PATTERNS)
-
-
-def classify_key_events(kev_dict: dict) -> tuple:
+def classify_key_events(kev_dict: dict, mode: str = 'available', users: dict | None = None) -> tuple:
     """キーイベント辞書を (患者アクション, 求人関連) の2カテゴリに分ける。
 
-    - tap/click 等のGA4自動計測・システムイベントはどちらにも入れない（除外）
-    - 求人関連は計測対象だが、予約・電話等の合計に混ぜないため別の辞書で返す
-    - 表示名へ変換し、それぞれ件数降順の辞書を返す
-    - 当月・前月とも同一ルールで分類するため、比較の整合が保証される
+    詳細な分類（完了到達・未分類・同数イベント）は event_classify.classify_event_counts()。
+    当月・前月とも同一ルールで分類するため、比較の整合が保証される。
     """
-    patient, recruit = {}, {}
-    for name, count in (kev_dict or {}).items():
-        raw_name = str(name).strip()
-        low = raw_name.lower()
-        if low in CV_EXCLUDE_EXACT:
-            continue
-        try:
-            n = int(count)
-        except (TypeError, ValueError):
-            continue
-        if n <= 0:
-            continue
-        target = recruit if is_recruit_event(raw_name) else patient
-        display = CV_DISPLAY_NAME_MAP.get(low, raw_name)
-        target[display] = target.get(display, 0) + n
-
-    def _sorted(d):
-        return dict(sorted(d.items(), key=lambda x: (-x[1], x[0])))
-    return _sorted(patient), _sorted(recruit)
+    r = classify_event_counts(kev_dict, mode=mode, users=users)
+    return r['patient'], r['recruit']
 
 
 def extract_cv_events(kev_dict: dict) -> dict:
-    """キーイベント辞書から患者の重要アクション（予約・電話等）のみを抽出する。
-
-    - tap/click 等のシステムイベントを除外
-    - 求人関連は別カテゴリのため含めない（extract_recruit_events() で取得）
-    - 表示名へ変換し、件数降順の辞書を返す
-    """
+    """キーイベント辞書から患者の重要アクション（予約・電話等）のみを抽出する。"""
     return classify_key_events(kev_dict)[0]
 
 
@@ -138,25 +118,204 @@ def extract_recruit_events(kev_dict: dict) -> dict:
     return classify_key_events(kev_dict)[1]
 
 
+# ─────────────────────────────────────────────────────
+# 純粋関数（検証用）
+# ─────────────────────────────────────────────────────
+def parse_yyyymmdd(s):
+    """'20260901' → date。不正なら None。"""
+    if not isinstance(s, str) or not re.fullmatch(r'\d{8}', s):
+        return None
+    try:
+        return _dt.date(int(s[:4]), int(s[4:6]), int(s[6:]))
+    except ValueError:
+        return None
+
+
+def period_labels(start: str, end: str) -> dict:
+    """期間の表示ラベル。暦月（1日〜末日）でない期間は月名で呼ばず期間で表示する。
+
+    戻り値: {'is_calendar_month', 'month_label', 'period_label'}
+      month_label  表の列見出し等に使う短いラベル（暦月: 2026年9月 / それ以外: 9/15〜10/12）
+      period_label 年つきの期間（2026/9/15〜2026/10/12）
+    """
+    s, e = parse_yyyymmdd(start), parse_yyyymmdd(end)
+    if not e:
+        return {'is_calendar_month': False, 'month_label': '', 'period_label': ''}
+    if not s:
+        return {'is_calendar_month': False, 'month_label': f'{e.year}年{e.month}月',
+                'period_label': ''}
+    period = f'{s.year}/{s.month}/{s.day}〜{e.year}/{e.month}/{e.day}'
+    last_day = calendar.monthrange(e.year, e.month)[1]
+    is_cal = (s.year == e.year and s.month == e.month and s.day == 1 and e.day == last_day)
+    if is_cal:
+        return {'is_calendar_month': True, 'month_label': f'{e.year}年{e.month}月',
+                'period_label': period}
+    return {'is_calendar_month': False, 'month_label': f'{s.month}/{s.day}〜{e.month}/{e.day}',
+            'period_label': period}
+
+
+def bad_numeric_cells(df: pd.DataFrame, cols, integer: bool = True) -> list:
+    """数値として使えないセルを [(行のキー, 列名, 元の値), ...] で返す。
+
+    `-`・空欄・数値に変換できない値・負数・非有限値、integer=True なら小数も不正とする。
+    （実データ・既存フィクスチャには `-` が正当な値として出る箇所は無かったため、すべて不正）
+    """
+    out = []
+    if df is None:
+        return out
+    for c in cols:
+        if c >= len(df.columns):
+            continue
+        col_name = str(df.columns[c])
+        for i, v in enumerate(df.iloc[:, c]):
+            s = str(v).strip().replace(',', '')
+            ok = True
+            try:
+                f = float(s)
+                if not math.isfinite(f) or f < 0 or (integer and f != int(f)):
+                    ok = False
+            except ValueError:
+                ok = False
+            if s == '' or s.lower() == 'nan':
+                ok = False
+            if not ok:
+                out.append((str(df.iloc[i, 0]).strip(), col_name, '' if s.lower() == 'nan' else s))
+    return out
+
+
+def _cell_key(v):
+    s = str(v).strip().replace(',', '')
+    try:
+        f = float(s)
+        if math.isfinite(f):
+            return round(f, 9)
+    except ValueError:
+        pass
+    return s
+
+
+def tables_consistent(df_a: pd.DataFrame, df_b: pd.DataFrame) -> bool:
+    """同じ表が2つのファイルにある場合に、内容が一致するか。
+
+    先頭列（キー）と、両方にある値の列を比べる（列の並び・行の順序は問わない）。
+    片方にしか無い列（例: スナップショットの上位ページにある直帰率）は比べない。
+    """
+    common = [c for c in df_a.columns[1:] if c in set(df_b.columns[1:])]
+    if not common:
+        return True
+
+    def rows(df):
+        key_col = df.columns[0]
+        return sorted(
+            (str(r[key_col]).strip(),) + tuple(_cell_key(r[c]) for c in common)
+            for _, r in df.iterrows()
+        )
+    return rows(df_a) == rows(df_b)
+
+
+def weighted_engagement(df_engage: pd.DataFrame, df_active: pd.DataFrame) -> tuple:
+    """日別の平均エンゲージメント時間を、同じ日（N 日目）の日別アクティブユーザーで加重平均する。
+
+    行の位置ではなく「N 日目」で結合する。日付の重複・欠け・ずれがあれば (None, 理由) を返す。
+    単純平均への黙った切り替えはしない。
+    戻り値: (平均秒 or None, 問題の説明 or '')
+    """
+    if df_engage is None or df_active is None:
+        return None, '日別アクティブユーザーが無いため加重平均できません'
+
+    def by_day(df):
+        days = _to_numeric_series(df.iloc[:, 0])
+        vals = _to_numeric_series(df.iloc[:, 1])
+        out, dup = {}, []
+        for d, v in zip(days, vals):
+            if pd.isna(d):
+                return None, ['日付（N 日目）が読めない行']
+            d = int(d)
+            if d in out:
+                dup.append(d)
+            out[d] = v
+        return out, dup
+
+    eng, dup_e = by_day(df_engage)
+    act, dup_a = by_day(df_active)
+    if eng is None or act is None:
+        return None, '日付（N 日目）が読めない行があります'
+    if dup_e or dup_a:
+        days = sorted(set(dup_e) | set(dup_a))
+        return None, f'同じ日（N 日目={",".join(f"{d:04d}" for d in days[:3])}）の行が複数あります'
+    if set(eng) != set(act):
+        only_e = sorted(set(eng) - set(act))
+        only_a = sorted(set(act) - set(eng))
+        parts = []
+        if only_e:
+            parts.append('平均エンゲージメント時間のみ: ' + ','.join(f'{d:04d}' for d in only_e[:3]))
+        if only_a:
+            parts.append('日別アクティブユーザーのみ: ' + ','.join(f'{d:04d}' for d in only_a[:3]))
+        return None, '日付（N 日目）が揃っていません（' + ' / '.join(parts) + '）'
+    num = den = 0.0
+    for d, e in eng.items():
+        w = act[d]
+        if pd.isna(w) or w <= 0 or pd.isna(e):
+            continue
+        num += float(e) * float(w)
+        den += float(w)
+    return (num / den if den > 0 else 0.0), ''
+
+
+def _meta_line(raw: str, key: str):
+    """「# key: 値」の行を行単位で読む（値が空なら ''、行が無ければ None）。
+
+    空白は [ \t]* に限定する。\s* だと値が空のとき改行を越えて次の行を値として拾っていた。
+    """
+    m = re.search(r'^#?[ \t]*' + re.escape(key) + r':[ \t]*([^\r\n]*?)[ \t]*\r?$',
+                  raw, re.MULTILINE)
+    return m.group(1).strip() if m else None
+
+
+def read_meta(raw: str) -> dict:
+    """アカウント・プロパティ・開始日・終了日（最初に出現した行）を返す。
+
+    property_line は「# プロパティ:」の行があったか（空のプロパティ名と、行が無いことを区別する）。
+    """
+    account = _meta_line(raw, 'アカウント')
+    prop = _meta_line(raw, 'プロパティ')
+    start = _meta_line(raw, '開始日')
+    end = _meta_line(raw, '終了日')
+    return {
+        'account': account or '',
+        'property': prop or '',
+        'property_line': prop is not None,
+        'start': start if start and re.fullmatch(r'\d{8}', start) else '',
+        'end': end if end and re.fullmatch(r'\d{8}', end) else '',
+    }
+
+
+def expected_day_keys(start: str, end: str):
+    """開始日〜終了日から期待する「N 日目」（0始まり）の集合。日付が読めなければ None。"""
+    s, e = parse_yyyymmdd(start), parse_yyyymmdd(end)
+    if not s or not e or s > e:
+        return None
+    return set(range((e - s).days + 1))
+
+
+def _fmt_sec(avg_sec: float) -> str:
+    m = int(avg_sec // 60)
+    s = int(avg_sec % 60)
+    return f"{m}分{s:02d}秒"
+
+
 def parse_ga4_csv(filepath_or_bytes) -> dict:
     """GA4エクスポートCSVを解析してセクション別データを返す。
 
     filepath_or_bytes: ファイルパス(str) または bytes/BytesIO
+
+    戻り値の 'issues' は、そのままPDFを作ると誤った数値になる問題（数値の欠損・
+    複数ファイル間の表の不一致・日付のずれ）のリスト。input_validation が生成を止める。
     """
     raw = _decode_text(filepath_or_bytes)
 
     # ヘッダメタ情報取得
-    account = re.search(r'アカウント:\s*(.+)', raw)
-    prop    = re.search(r'プロパティ:\s*(.+)', raw)
-    start_d = re.search(r'開始日:\s*(\d{8})', raw)
-    end_d   = re.search(r'終了日:\s*(\d{8})', raw)
-
-    meta = {
-        'account':  account.group(1).strip() if account else '',
-        'property': prop.group(1).strip() if prop else '',
-        'start':    start_d.group(1) if start_d else '',
-        'end':      end_d.group(1) if end_d else '',
-    }
+    meta = read_meta(raw)
 
     # GA4のどの画面から出力されたCSVかを識別する。
     # 「集客サマリー」は上位ページやエンゲージメント時間を含まないため、
@@ -168,85 +327,221 @@ def parse_ga4_csv(filepath_or_bytes) -> dict:
     )
     meta['source_report'] = source_report.group(1) if source_report else ''
 
-    # 日付表示用
-    if meta['end']:
-        d = meta['end']
-        meta['month_label'] = f"{d[:4]}年{int(d[4:6])}月"
-    else:
-        meta['month_label'] = ''
+    # 日付表示用（暦月でない期間は「9/15〜10/12」のように期間で表示する）
+    meta.update(period_labels(meta['start'], meta['end']))
 
     lines = raw.splitlines()
 
     # 複数CSVを結合した入力（csv_merge.merge_ga4_csvs）では、各ファイル冒頭の
-    # 「# ----」直後の行に出力元レポート名がある。セクションがどのレポート由来かを
-    # 判定するため、レポート名の出現位置を控えておく。
+    # 「# ----」直後の行に出力元レポート名、その次の行にファイル名がある。
+    # セクションがどのレポート・どのファイル由来かを判定するため、出現位置を控えておく。
     report_titles = []
-    for i in range(len(lines) - 1):
-        if re.match(r'^#\s*-{5,}\s*$', lines[i].strip()):
+    file_markers = []
+    for i in range(len(lines)):
+        s = lines[i].strip()
+        if s.startswith(FILE_MARKER_PREFIX):
+            file_markers.append((i, s[len(FILE_MARKER_PREFIX):].strip()))
+        if i + 1 < len(lines) and re.match(r'^#\s*-{5,}\s*$', s):
             m = re.match(r'^#\s*(.+?)\s*$', lines[i + 1].strip())
             if m and not re.match(r'^(アカウント|プロパティ)\s*:', m.group(1)) \
-                    and not re.match(r'^-{5,}$', m.group(1)):
+                    and not re.match(r'^-{5,}$', m.group(1)) \
+                    and not lines[i + 1].strip().startswith(FILE_MARKER_PREFIX):
                 report_titles.append((i + 1, m.group(1)))
 
-    def section_source(line_index: int) -> str:
-        title = ''
-        for idx, name in report_titles:
+    def _last_before(items, line_index):
+        val = ''
+        for idx, name in items:
             if idx < line_index:
-                title = name
+                val = name
             else:
                 break
-        return title
+        return val
 
-    def read_section(header_pattern: str, accept=None):
-        """指定ヘッダ行以降のCSVブロックを読み込む。
+    def section_source(line_index: int) -> str:
+        return _last_before(report_titles, line_index)
 
-        accept: ヘッダ行の行番号を受け取り、採用するかを返す関数（省略時は最初の一致）
-        """
-        start_i = None
-        col_names = None
+    def section_file(line_index: int) -> str:
+        return _last_before(file_markers, line_index)
+
+    issues = []
+
+    def read_all(header_pattern: str, accept=None) -> list:
+        """指定ヘッダ行に一致するCSVブロックをすべて読む。"""
+        found = []
         for i, line in enumerate(lines):
-            if re.search(header_pattern, line.strip()):
-                if accept is not None and not accept(i):
-                    continue
-                col_names = [c.strip() for c in line.strip().split(',')]
-                start_i = i + 1
-                break
-        if start_i is None:
+            if not re.search(header_pattern, line.strip()):
+                continue
+            if accept is not None and not accept(i):
+                continue
+            col_names = [c.strip() for c in line.strip().split(',')]
+            block = []
+            for row in lines[i + 1:]:
+                row = row.strip()
+                if not row or row.startswith('#'):
+                    break
+                block.append(row)
+            src = section_file(i) or section_source(i) or '入力CSV'
+            if not block:
+                # 見出しだけの表は「出力済み0件」。他ファイルの同じ表との一致検査に含める
+                found.append({'df': pd.DataFrame(columns=col_names), 'src': src, 'error': False,
+                              'empty': True})
+                continue
+            try:
+                df = pd.read_csv(io.StringIO('\n'.join(block)), names=col_names, header=None,
+                                 dtype=str, keep_default_na=False)
+                found.append({'df': df, 'src': src, 'error': False})
+            except Exception:
+                found.append({'df': None, 'src': src, 'error': True})
+        return found
+
+    def pick_consistent(found: list, label: str):
+        """同じ表が複数あれば一致を確かめ、先頭を返す（空の表＝出力済み0件も比べる）。
+
+        先頭が空の表なら None（見出しだけの表は従来どおり「無い」扱い。キーイベントは
+        has_kev_header で「設定済み0件」と判定する）。
+        """
+        tables = [f for f in found if f['df'] is not None]
+        if not tables:
             return None
-        block = []
-        for line in lines[start_i:]:
-            line = line.strip()
-            if not line or line.startswith('#'):
+        first = tables[0]
+        for other in tables[1:]:
+            if not tables_consistent(first['df'], other['df']):
+                empty_note = ''
+                if first.get('empty') or other.get('empty'):
+                    empty_note = '一方は見出しだけ（0件）で、もう一方には行があります。'
+                issues.append(
+                    f'「{label}」の表が複数のファイルにあり、値が一致しません'
+                    f'（{first["src"]} と {other["src"]}）。{empty_note}同じ期間・同じ条件で出力したファイルか'
+                    '確認してください。どちらかを選んだり合算したりすると数値が変わるため、PDFは生成できません。'
+                )
                 break
-            block.append(line)
-        if not block:
+        if first.get('empty'):
             return None
-        try:
-            return pd.read_csv(
-                io.StringIO('\n'.join(block)),
-                names=col_names,
-                header=None,
+        return first
+
+    expected_days = expected_day_keys(meta['start'], meta['end'])
+
+    def read_section(header_pattern: str, label: str, accept=None,
+                     value_cols=(1,), integer: bool = True, day_key: bool = False,
+                     check: bool = True, expect_days: bool = False):
+        """表を読み、複数ファイルにあれば一致を確かめ、数値の欠損を記録して返す。"""
+        found = read_all(header_pattern, accept)
+        for f in found:
+            if f['error']:
+                issues.append(f'「{label}」（{f["src"]}）の表を読み込めません。')
+        first = pick_consistent(found, label)
+        if first is None:
+            return None
+        df = first['df']
+        if check:
+            bad = bad_numeric_cells(df, value_cols, integer=integer)
+            if day_key:
+                bad += bad_numeric_cells(df, (0,), integer=True)
+            if bad:
+                ex = '、'.join(f'「{k}」の行の{c}「{v}」' for k, c, v in bad[:3])
+                more = f' ほか{len(bad) - 3}件' if len(bad) > 3 else ''
+                issues.append(
+                    f'「{label}」（{first["src"]}）に数値として読めない値があります: {ex}{more}。'
+                    '0件として扱うと誤った数値になるため、PDFは生成できません。'
+                )
+            if day_key and not bad:
+                days = _to_numeric_series(df.iloc[:, 0])
+                if days.duplicated().any():
+                    issues.append(f'「{label}」（{first["src"]}）に同じ日（N 日目）の行が複数あります。')
+                elif expect_days and expected_days is not None:
+                    # 開始日〜終了日の全日がそろっているか（両方の表から同じ日が欠けても検知する）
+                    got = {int(d) for d in days.dropna()}
+                    missing = sorted(expected_days - got)
+                    extra = sorted(got - expected_days)
+                    if missing or extra:
+                        parts = []
+                        if missing:
+                            parts.append('欠けている日: ' + ','.join(f'{d:04d}' for d in missing[:5])
+                                         + (f' ほか{len(missing) - 5}日' if len(missing) > 5 else ''))
+                        if extra:
+                            parts.append('期間外の日: ' + ','.join(f'{d:04d}' for d in extra[:5]))
+                        issues.append(
+                            f'「{label}」（{first["src"]}）の日付（N 日目）が期間（開始日〜終了日）と'
+                            f'合いません（{" / ".join(parts)}）。欠けた日を0件として扱うと誤った数値になるため、'
+                            'PDFは生成できません。'
+                        )
+        # 以降の処理は数値で扱う（検証済み。不正値は NaN）
+        for c in value_cols:
+            if c < len(df.columns):
+                df.isetitem(c, _to_numeric_series(df.iloc[:, c]))
+        if day_key:
+            df.isetitem(0, _to_numeric_series(df.iloc[:, 0]))
+        return df
+
+    def raw_rows(header_pattern: str, label: str, accept=None):
+        """イベント表を文字列のまま読む（同名行の扱いを aggregate_event_rows で決めるため）。"""
+        found = read_all(header_pattern, accept)
+        for f in found:
+            if f['error']:
+                issues.append(f'「{label}」（{f["src"]}）の表を読み込めません。')
+        first = pick_consistent(found, label)
+        if first is None:
+            return None, None
+        df = first['df']
+        bad = bad_numeric_cells(df, (1,), integer=True)
+        if bad:
+            ex = '、'.join(f'「{k}」の行の{c}「{v}」' for k, c, v in bad[:3])
+            more = f' ほか{len(bad) - 3}件' if len(bad) > 3 else ''
+            issues.append(
+                f'「{label}」（{first["src"]}）に数値として読めない値があります: {ex}{more}。'
+                '0件として扱うと誤った数値になるため、PDFは生成できません。'
             )
-        except Exception:
-            return None
+        users_col = None
+        for ci, c in enumerate(df.columns):
+            if str(c).strip() == '総ユーザー数':
+                users_col = ci
+        rows = []
+        for _, r in df.iterrows():
+            cells = tuple(str(x).strip() for x in r.tolist())
+            name = cells[0]
+            cnt = _to_numeric_series(pd.Series([cells[1]])).iloc[0] if len(cells) > 1 else np.nan
+            if pd.isna(cnt) or not name:
+                continue
+            u = None
+            if users_col is not None and users_col < len(cells):
+                uv = _to_numeric_series(pd.Series([cells[users_col]])).iloc[0]
+                if pd.notna(uv) and float(uv) >= 0 and float(uv) == int(uv):
+                    u = int(uv)
+            rows.append((name, int(cnt), u, cells))
+        return df, rows
 
     # ─ 各セクション取得 ─
-    df_summary = read_section(r'^アクティブ ユーザー,新規ユーザー数,アクティブ ユーザーあたりの平均エンゲージメント時間,イベント数$')
-    df_active = read_section(r'N 日目,アクティブ ユーザー$')
-    df_new    = read_section(r'N 日目,新規ユーザー数')
-    df_engage = read_section(r'N 日目,アクティブ ユーザーあたりの平均エンゲージメント時間')
-    df_ch_new = read_section(r'ユーザーの最初のメインのチャネル グループ.*新規ユーザー数')
-    df_ch_ses = read_section(r'セッションのメインのチャネル グループ.*セッション')
+    df_summary = read_section(
+        r'^アクティブ ユーザー,新規ユーザー数,アクティブ ユーザーあたりの平均エンゲージメント時間,イベント数$',
+        'サマリー', check=False)
+    df_active = read_section(r'N 日目,アクティブ ユーザー$', '日別アクティブユーザー', day_key=True,
+                             expect_days=True)
+    df_new    = read_section(r'N 日目,新規ユーザー数', '日別新規ユーザー', day_key=True,
+                             expect_days=True)
+    df_engage = read_section(r'N 日目,アクティブ ユーザーあたりの平均エンゲージメント時間',
+                             '平均エンゲージメント時間', integer=False, day_key=True,
+                             expect_days=True)
+    # チャネル: GA4のチャネルグループを優先。無い場合は参照元/メディアで代替する。
+    # 参照元/メディアの代替表の値は「アクティブユーザー」であり新規ユーザーではないため、
+    # 指標の種類を保持して、新規ユーザーの代わりには使わない（ch_new_metric）。
+    ch_new_metric, ch_new_dimension = 'new_users', 'channel_group'
+    df_ch_new = read_section(r'ユーザーの最初のメインのチャネル グループ.*新規ユーザー数',
+                             'チャネル別新規ユーザー')
     if df_ch_new is None:
-        df_ch_new = read_section(r'ユーザーの最初の参照元 / メディア,アクティブ ユーザー$')
+        df_ch_new = read_section(r'ユーザーの最初の参照元 / メディア,アクティブ ユーザー$',
+                                 '参照元/メディア別アクティブユーザー')
+        ch_new_metric, ch_new_dimension = 'active_users', 'source_medium'
+    ch_ses_dimension = 'channel_group'
+    df_ch_ses = read_section(r'セッションのメインのチャネル グループ.*セッション', 'チャネル別セッション')
     if df_ch_ses is None:
-        df_ch_ses = read_section(r'セッションの参照元 / メディア,セッション$')
-    df_pages  = read_section(r'ページ タイトルとスクリーン クラス,表示回数')
-    df_events = read_section(r'イベント名,イベント数')
-    df_kev    = read_section(r'イベント名,キーイベント')
+        df_ch_ses = read_section(r'セッションの参照元 / メディア,セッション$', '参照元/メディア別セッション')
+        ch_ses_dimension = 'source_medium'
+    df_pages  = read_section(r'ページ タイトルとスクリーン クラス,表示回数', '上位ページ')
+    df_events = read_section(r'イベント名,イベント数', 'イベント名別イベント数', check=False)
+    df_kev, kev_rows = raw_rows(r'^イベント名,キーイベント$', 'キーイベント（イベント名別）')
     df_kev_platform = None
     if df_kev is None:
-        df_kev_platform = read_section(r'プラットフォーム,キーイベント$')
+        df_kev_platform = read_section(r'プラットフォーム,キーイベント$', 'キーイベント（プラットフォーム別）')
     has_kev_header = bool(
         re.search(r'^イベント名,キーイベント[ \t\r]*$', raw, re.MULTILINE)
     )
@@ -256,17 +551,25 @@ def parse_ga4_csv(filepath_or_bytes) -> dict:
     # キーイベントのイベント別内訳が無い場合に限り、イベント名から候補を判定する。
     # 判定元は「エンゲージメントの概要」または「イベント」レポート由来の
     # 「イベント名,イベント数」に限る（従来のスナップショット単体の挙動は変えない）。
-    df_events_for_inference = None
+    df_events_for_inference, inference_rows = None, None
     if not has_kev_header:
-        df_events_for_inference = read_section(
+        df_events_for_inference, inference_rows = raw_rows(
             r'^イベント名,イベント数',
+            'イベント名別イベント数',
             accept=lambda i: _is_event_inference_source(section_source(i)),
         )
-    df_trend  = read_section(r'N 日目,30 日,7 日,1 日')
+    # 総ユーザー数（同数イベントの二重計測の確認に使う。「イベント」レポートにのみある）
+    users_map, event_count_map = {}, {}
+    _, user_rows = raw_rows(r'^イベント名,イベント数,総ユーザー数', 'イベント（総ユーザー数）')
+    if user_rows:
+        event_count_map, users_map = aggregate_event_rows(user_rows)
+
+    df_trend  = read_section(r'N 日目,30 日,7 日,1 日', '30日・7日・1日アクティブユーザー',
+                             value_cols=(1, 2, 3), day_key=True)
     # 国別アクティブユーザー（国 ID 優先、無ければ 国）
-    df_country = read_section(r'国 ID,アクティブ ユーザー$')
+    df_country = read_section(r'国 ID,アクティブ ユーザー$', '国別アクティブユーザー', check=False)
     if df_country is None:
-        df_country = read_section(r'^国,アクティブ ユーザー$')
+        df_country = read_section(r'^国,アクティブ ユーザー$', '国別アクティブユーザー', check=False)
 
     # ─ 国別サマリ（海外アクセスの有無を正確に把握するため） ─
     # 注意: KPI(セッション/ユーザー)はチャネル別・日別集計から算出されるため、
@@ -347,9 +650,11 @@ def parse_ga4_csv(filepath_or_bytes) -> dict:
     else:
         kpis['active_users'] = 0
 
+    # 新規ユーザー: 日別新規ユーザーの合計。チャネル別の代替は「新規ユーザー」の表に限る
+    # （参照元/メディア別のアクティブユーザーを新規ユーザーとして足さない）。
     if df_new is not None:
         kpis['new_users'] = int(_to_numeric_series(df_new.iloc[:, 1]).sum())
-    elif df_ch_new is not None:
+    elif df_ch_new is not None and ch_new_metric == 'new_users':
         kpis['new_users'] = int(_to_numeric_series(df_ch_new.iloc[:, 1]).sum())
     elif df_summary is not None and not df_summary.empty:
         val = _to_numeric_series(pd.Series([df_summary.iloc[0, 1]])).iloc[0]
@@ -362,94 +667,96 @@ def parse_ga4_csv(filepath_or_bytes) -> dict:
     else:
         kpis['sessions'] = 0
 
+    # 平均エンゲージメント時間: 日別値を同じ日（N 日目）の日別アクティブユーザーで加重平均する。
+    # 行位置での対応づけ・単純平均への黙った切り替えは v9 で廃止。
     if df_engage is not None:
-        # 日別平均の単純平均はユーザー数の少ない日を過大評価するため、
-        # 日別アクティブユーザー数による加重平均を採用（取得不可時は単純平均）
-        eng_vals = _to_numeric_series(df_engage.iloc[:, 1])
-        weights = None
-        if df_active is not None and len(df_active) == len(df_engage):
-            weights = _to_numeric_series(df_active.iloc[:, 1])
-        avg_sec = None
-        if weights is not None:
-            valid = eng_vals.notna() & weights.notna() & (weights > 0)
-            if valid.any() and weights[valid].sum() > 0:
-                avg_sec = float((eng_vals[valid] * weights[valid]).sum() / weights[valid].sum())
+        avg_sec, problem = weighted_engagement(df_engage, df_active)
+        if problem and df_active is not None:
+            issues.append(f'平均エンゲージメント時間を日別アクティブユーザーで加重平均できません: {problem}。')
         if avg_sec is None:
-            avg_sec = eng_vals.mean()
-        if pd.isna(avg_sec):
-            avg_sec = 0
-        kpis['avg_engage_sec'] = float(avg_sec)
-        m = int(avg_sec // 60)
-        s = int(avg_sec % 60)
-        kpis['avg_engage_str'] = f"{m}分{s:02d}秒"
+            kpis['avg_engage_sec'] = 0
+            kpis['avg_engage_str'] = '取得不能'
+        else:
+            kpis['avg_engage_sec'] = float(avg_sec)
+            kpis['avg_engage_str'] = _fmt_sec(float(avg_sec))
     elif df_summary is not None and not df_summary.empty:
         avg_sec = _to_numeric_series(pd.Series([df_summary.iloc[0, 2]])).iloc[0]
         if pd.isna(avg_sec):
             avg_sec = 0
         kpis['avg_engage_sec'] = float(avg_sec)
-        m = int(avg_sec // 60)
-        s = int(avg_sec % 60)
-        kpis['avg_engage_str'] = f"{m}分{s:02d}秒"
+        kpis['avg_engage_str'] = _fmt_sec(float(avg_sec))
     else:
         kpis['avg_engage_sec'] = 0
         kpis['avg_engage_str'] = '-'
 
-    # キーイベント（患者アクション＝key_events / 求人関連＝key_events_recruit）
-    # 旧実装は tap 等のシステムイベント・求人系まで合算しており過大だったため、
-    # classify_key_events() で除外・分類・表示名統一した結果を全ページの単一ソースとする。
-    # key_events_total は患者アクション（予約・電話等）のみの合計（求人関連は含めない）。
-    if df_kev is not None:
-        kev_raw = {}
-        for _, row in df_kev.iterrows():
-            value = _to_numeric_series(pd.Series([row.iloc[1]])).iloc[0]
-            kev_raw[str(row.iloc[0])] = int(value) if pd.notna(value) else 0
-        kpis['key_events_raw'] = kev_raw
-        kpis['key_events'], kpis['key_events_recruit'] = classify_key_events(kev_raw)
-        kpis['key_events_total'] = sum(kpis['key_events'].values())
+    # キーイベント（患者アクション＝key_events / 求人関連＝key_events_recruit ほか）
+    # classify_event_counts() の結果を全ページの単一ソースとする。
+    # key_events_total は合計に入れる予約・電話等のみ（求人関連・完了到達・未分類・
+    # 同数のため除外したイベントは含めない）。
+    classification = None
+    if kev_rows is not None:
+        counts, _ = aggregate_event_rows(kev_rows)
+        kpis['key_events_raw'] = counts
+        classification = classify_event_counts(counts, mode='available', users=users_map,
+                                              event_counts=event_count_map)
         kpis['key_events_status'] = 'available'
-    elif df_events_for_inference is not None:
+    elif inference_rows is not None:
         # GA4のキーイベント設定（どのイベントがキーイベントか）は出力に含まれないため、
-        # イベント名から extract_cv_events() と同じ除外規則で候補を判定する。
-        # GA4のキーイベント明細（available）とは集計方法が異なるため、別状態として扱い、
-        # available との前月比較は行わない（compare_utils.key_events_comparison）。
-        ev_raw = {}
-        for _, row in df_events_for_inference.iterrows():
-            value = _to_numeric_series(pd.Series([row.iloc[1]])).iloc[0]
-            name = str(row.iloc[0]).strip()
-            ev_raw[name] = ev_raw.get(name, 0) + (int(value) if pd.notna(value) else 0)
-        kpis['key_events_raw'] = ev_raw
-        kpis['key_events'], kpis['key_events_recruit'] = classify_key_events(ev_raw)
-        kpis['key_events_total'] = sum(kpis['key_events'].values())
+        # イベント名から判定する。GA4のキーイベント明細（available）とは集計方法が異なるため、
+        # 別状態として扱い、available との前月比較は行わない（compare_utils.key_events_comparison）。
+        counts, inf_users = aggregate_event_rows(inference_rows)
+        merged_users = dict(users_map)
+        for k, v in inf_users.items():
+            if v is not None:
+                merged_users[k] = v
+        kpis['key_events_raw'] = counts
+        classification = classify_event_counts(counts, mode='inferred', users=merged_users)
         kpis['key_events_status'] = KEY_EVENTS_INFERRED
     elif df_kev_platform is not None:
-        # イベント名の明細が無い場合はシステムイベントを除外できないため、
-        # プラットフォーム合計をそのまま使う（過大の可能性あり・明細出力を推奨）
+        # イベント名の明細が無い場合は、予約・電話等と求人・その他を分けられない。
+        # プラットフォーム合計は別の値（key_events_platform_total）として保持し、
+        # 予約・電話アクションの件数としては使わない（内訳取得不能）。
         kev_vals = _to_numeric_series(df_kev_platform.iloc[:, 1])
         kpis['key_events_raw'] = {}
-        kpis['key_events'] = {}
-        kpis['key_events_total'] = int(kev_vals.sum())
-        kpis['key_events_status'] = 'fallback'
+        kpis['key_events_platform_total'] = int(kev_vals.fillna(0).sum())
+        kpis['key_events_status'] = KEY_EVENTS_FALLBACK
     elif has_kev_header or has_kev_platform_header:
         # ヘッダーがありデータ行が無い場合は「設定済み0件」として扱う。
         # セクション自体が無い「未出力」と区別し、誤った前月比を防ぐ。
         kpis['key_events_raw'] = {}
-        kpis['key_events'] = {}
-        kpis['key_events_total'] = 0
         kpis['key_events_status'] = 'configured_zero'
     else:
         kpis['key_events_raw'] = {}
-        kpis['key_events'] = {}
-        kpis['key_events_total'] = 0
         kpis['key_events_status'] = 'missing'
 
+    if classification is None:
+        classification = classify_event_counts({})
+    kpis['key_events'] = classification['patient']
+    kpis['key_events_total'] = sum(kpis['key_events'].values())
     # 求人関連イベント（別カテゴリ）。key_events_total には含めない。
-    # 予約・電話アクションの合計と参考比率（÷セッション数）に求人応募を混ぜないため。
-    kpis.setdefault('key_events_recruit', {})
+    kpis['key_events_recruit'] = classification['recruit']
     kpis['key_events_recruit_total'] = sum(kpis['key_events_recruit'].values())
+    # 完了到達（外部予約サイト等の完了画面）。予約成立数ではなく、クリックの後工程のため合計に含めない
+    kpis['key_events_completion'] = classification['completion']
+    kpis['key_events_completion_total'] = sum(kpis['key_events_completion'].values())
+    kpis['key_events_completion_base'] = classification['completion_base']
+    kpis['key_events_completion_counted'] = classification['completion_counted']
+    # イベント名から予約・電話等と判定できなかったイベント（イベント名から判定の場合のみ）
+    kpis['key_events_unclassified'] = classification['unclassified']
+    kpis['key_events_unclassified_total'] = sum(kpis['key_events_unclassified'].values())
+    # 同数のため合計から除外したイベント（同じ操作を2つのイベントで数えている疑い）
+    kpis['key_events_dedup_excluded'] = classification['dedup_excluded']
+    kpis['key_events_dedup_groups'] = classification['dedup_groups']
+    kpis['key_events_dedup_unverified'] = classification['dedup_unverified']
+    kpis.setdefault('key_events_platform_total', None)
 
     return {
         'meta': meta,
         'kpis': kpis,
+        'issues': issues,
+        'ch_new_metric': ch_new_metric,
+        'ch_new_dimension': ch_new_dimension,
+        'ch_ses_dimension': ch_ses_dimension,
         'df_active': df_active,
         'df_new': df_new,
         'df_engage': df_engage,

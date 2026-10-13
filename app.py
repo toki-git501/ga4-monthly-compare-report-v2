@@ -6,8 +6,8 @@ import traceback
 from datetime import datetime
 from report_logic_compare import generate_compare_report
 from csv_parser import parse_ga4_csv
-from input_validation import validate_csv_inputs
-from csv_merge import CsvMergeError, merge_ga4_csvs
+from input_validation import input_signature, validate_csv_inputs
+from csv_merge import CsvMergeError, merge_ga4_csvs_with_notes
 
 # バージョンはPDF生成側と共有する（出力物からデプロイ状態を判定できるようにするため）
 from report_logic_compare import REPORT_VERSION as APP_VERSION
@@ -180,6 +180,10 @@ st.caption(
     "GA4の「レポートのスナップショット」だけでは必要な項目が揃わない場合は、同じ期間で出力した"
     "「レポートのスナップショット」「集客サマリー」「エンゲージメントの概要」（任意で「イベント」）を"
     "まとめて選択してください。同じ月の複数ファイルは1セットとして結合して読み込みます。"
+    "同じ表が複数のファイルにあって値が食い違う場合、数値の欄が「-」・空欄の場合、日別の表に"
+    "期間内の日が欠けている場合は、誤った数値を出さないよう生成を止めます。「イベント」のCSVを加えると、"
+    "件数と総ユーザー数が同じ2つのイベント（同じ操作を2つのイベントで数えている可能性があるもの）を"
+    "見分け、合計には1つ分のみ含めます。この扱いが当月と前月で食い違う場合、合計の前月比は出しません。"
 )
 
 st.divider()
@@ -221,6 +225,19 @@ with col1:
 with col2:
     st.subheader("2. レポートの生成")
 
+    # 入力（CSV・ロゴ・医院名・担当者・URL・版・モード）が変わったら、保存済みPDFの表示を取り消す
+    current_sig = input_signature(
+        *[x for f in (uploaded_cur or []) for x in (f.name, f.getvalue())],
+        '|prev|',
+        *[x for f in (uploaded_prev or []) for x in (f.name, f.getvalue())],
+        '|logo|', uploaded_logo.getvalue() if uploaded_logo else b'',
+        company_name, staff_name, site_url, report_type,
+    )
+    if st.session_state.get('pdf_ready') and st.session_state.get('pdf_sig') != current_sig:
+        for key in ('pdf_ready', 'pdf_data', 'pdf_sig', 'pdf_file_name', 'pdf_single_mode'):
+            st.session_state.pop(key, None)
+        st.info("入力内容が変わったため、前回生成したPDFの表示を取り消しました。もう一度生成してください。")
+
     if uploaded_cur:
         single_mode = not uploaded_prev
         if single_mode:
@@ -236,19 +253,27 @@ with col2:
         if st.button(button_label):
             # 同じ月の複数ファイルを1セットに結合する。プロパティ・期間が
             # ファイル間で異なる場合は結合せずに止める（別の月・別の医院の混在防止）。
+            # 生成を始めた時点で前回のPDFは無効にする（検証で止まった場合に古いPDFを残さない）
+            for key in ('pdf_ready', 'pdf_data', 'pdf_sig', 'pdf_file_name', 'pdf_single_mode'):
+                st.session_state.pop(key, None)
             merge_errors = []
+            merge_notes = []
             cur_bytes = prev_bytes = None
             try:
-                cur_bytes = merge_ga4_csvs([f.getvalue() for f in uploaded_cur],
-                                           names=[f.name for f in uploaded_cur])
+                cur_bytes, notes = merge_ga4_csvs_with_notes(
+                    [f.getvalue() for f in uploaded_cur], names=[f.name for f in uploaded_cur])
+                merge_notes += [f"当月CSV: {n}" for n in notes]
             except CsvMergeError as exc:
                 merge_errors.append(f"当月CSV: {exc}")
             if not single_mode:
                 try:
-                    prev_bytes = merge_ga4_csvs([f.getvalue() for f in uploaded_prev],
-                                                names=[f.name for f in uploaded_prev])
+                    prev_bytes, notes = merge_ga4_csvs_with_notes(
+                        [f.getvalue() for f in uploaded_prev], names=[f.name for f in uploaded_prev])
+                    merge_notes += [f"比較月CSV: {n}" for n in notes]
                 except CsvMergeError as exc:
                     merge_errors.append(f"比較月CSV: {exc}")
+            for note in merge_notes:
+                st.warning(f"⚠ {note}")
             if merge_errors:
                 for err in merge_errors:
                     st.error(err)
@@ -308,6 +333,11 @@ with col2:
                         with open(output_pdf_path, "rb") as pdf_file:
                             st.session_state['pdf_data'] = pdf_file.read()
 
+                    # 生成時の入力署名・ファイル名・モードを固定して保存する
+                    st.session_state['pdf_sig'] = current_sig
+                    st.session_state['pdf_file_name'] = (
+                        f"GA4月次比較レポート_{company_name}_{datetime.now().strftime('%Y%m%d')}.pdf")
+                    st.session_state['pdf_single_mode'] = single_mode
                     st.session_state['pdf_ready'] = True
                     st.rerun()
                 except Exception as e:
@@ -317,20 +347,20 @@ with col2:
         # 生成済みPDFがあれば表示
         if st.session_state.get('pdf_ready'):
             pdf_data = st.session_state['pdf_data']
-            done_text = "単月分析レポートの生成が完了しました！" if single_mode else "比較レポートの生成が完了しました！"
+            done_text = ("単月分析レポートの生成が完了しました！"
+                         if st.session_state.get('pdf_single_mode') else "比較レポートの生成が完了しました！")
             st.success(done_text)
 
             st.download_button(
                 label="📥 PDFをダウンロードする",
                 data=pdf_data,
-                file_name=f"GA4月次比較レポート_{company_name}_{datetime.now().strftime('%Y%m%d')}.pdf",
+                file_name=st.session_state.get('pdf_file_name') or "GA4月次比較レポート.pdf",
                 mime="application/pdf"
             )
     else:
         st.info("当月のCSVをアップロードしてください（比較したい月のCSVは任意）。")
-        if 'pdf_ready' in st.session_state:
-            del st.session_state['pdf_ready']
-            del st.session_state['pdf_data']
+        for key in ('pdf_ready', 'pdf_data', 'pdf_sig', 'pdf_file_name', 'pdf_single_mode'):
+            st.session_state.pop(key, None)
 
 # プレビュー表示
 if st.session_state.get('pdf_ready'):

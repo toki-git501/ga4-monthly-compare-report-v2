@@ -7,25 +7,129 @@
 import pandas as pd
 import numpy as np
 
-from csv_parser import KEY_EVENTS_INFERRED
+from csv_parser import KEY_EVENTS_FALLBACK, KEY_EVENTS_INFERRED
 
 
 def key_events_comparison(cur_status: str, prev_status: str) -> tuple:
     """キーイベント発生回数を前月比較してよいかを返す: (comparable, reason)。
 
     reason:
-      'missing'         いずれかの月でキーイベントが未出力（0件として扱わない）
-      'method_mismatch' 片方がGA4のキーイベント明細、片方がイベント名からの判定で、
-                        集計方法が異なる（差を増減として示すと誤解を招く）
-      ''                比較可能
+      'missing'               いずれかの月でキーイベントが未出力（0件として扱わない）
+      'breakdown_unavailable' いずれかの月でイベント別の内訳が無く、プラットフォーム合計しか無い
+                              （予約・電話等と求人・その他を分けられないため比較しない）
+      'method_mismatch'       片方がGA4のキーイベント明細、片方がイベント名からの判定で、
+                              集計方法が異なる（差を増減として示すと誤解を招く）
+      ''                      比較可能
     """
     cur_status = cur_status or 'missing'
     prev_status = prev_status or 'missing'
     if cur_status == 'missing' or prev_status == 'missing':
         return False, 'missing'
+    if cur_status == KEY_EVENTS_FALLBACK or prev_status == KEY_EVENTS_FALLBACK:
+        return False, 'breakdown_unavailable'
     if (cur_status == KEY_EVENTS_INFERRED) != (prev_status == KEY_EVENTS_INFERRED):
         return False, 'method_mismatch'
     return True, ''
+
+
+def _excluded_names(kpis: dict) -> set:
+    """合計から外したイベント（同数のため除外・完了到達として別掲）の名前。"""
+    kpis = kpis or {}
+    return set(kpis.get('key_events_dedup_excluded') or {}) | set(kpis.get('key_events_completion') or {})
+
+
+def _present_names(kpis: dict) -> set:
+    kpis = kpis or {}
+    return set(kpis.get('key_events') or {}) | _excluded_names(kpis)
+
+
+def treatment_mismatch_events(cur_kpis: dict, prev_kpis: dict) -> list:
+    """両月にあるイベントで、合計に含めるかどうかが月によって違うものを返す。
+
+    戻り値: [{'name': 名前, 'cur_included': bool, 'prev_included': bool}, ...]（名前順）
+    片方の月だけ同数のため除外した・完了到達として別掲した場合、合計の前月差は
+    イベントの増減ではなく集計対象の違いを表してしまうため、比較しない。
+    """
+    cur_ex, prev_ex = _excluded_names(cur_kpis), _excluded_names(prev_kpis)
+    both = _present_names(cur_kpis) & _present_names(prev_kpis)
+    out = []
+    for name in sorted(both, key=str):
+        if (name in cur_ex) != (name in prev_ex):
+            out.append({'name': name, 'cur_included': name not in cur_ex,
+                        'prev_included': name not in prev_ex})
+    return out
+
+
+def incomparable_text(reason: str) -> str:
+    """比較できない理由の短い表示。"""
+    if reason == 'treatment_mismatch':
+        return '比較不能（合計の対象が月で異なる）'
+    if reason == 'method_mismatch':
+        return '比較不能（集計方法が異なる）'
+    if reason == 'breakdown_unavailable':
+        return '比較不能（内訳取得不能）'
+    return '比較不能（未出力）'
+
+
+def shorten_labels_unique(names, max_w, measure=len, ellipsis='…') -> list:
+    """ラベルを max_w（measure で測った幅）に収め、省略後も互いに区別できるようにする。
+
+    まず末尾を省略する。省略後に同じラベルになる名前（共通の先頭を持つ長い名前）は、
+    先頭と末尾を残して中間を省略する。それでも重なる場合は番号を付ける。
+    """
+    names = [str(n) for n in names]
+
+    def fits(s):
+        return measure(s) <= max_w
+
+    def head(s):
+        if fits(s):
+            return s
+        while s and not fits(s + ellipsis):
+            s = s[:-1]
+        return s + ellipsis
+
+    def head_tail(s):
+        if fits(s):
+            return s
+        best = None
+        for tail_n in range(1, len(s)):
+            tail = s[-tail_n:]
+            h = s[:-tail_n]
+            while h and not fits(h + ellipsis + tail):
+                h = h[:-1]
+            if not h:
+                break
+            best = h + ellipsis + tail
+            if len(h) <= tail_n:
+                break
+        return best or head(s)
+
+    out = [head(n) for n in names]
+    groups = {}
+    for i, lab in enumerate(out):
+        groups.setdefault(lab, []).append(i)
+    for lab, idxs in groups.items():
+        if len({names[i] for i in idxs}) > 1:
+            for i in idxs:
+                out[i] = head_tail(names[i])
+    # それでも重なるものは番号で区別する
+    seen = {}
+    for i, lab in enumerate(out):
+        if lab in seen and names[seen[lab]] != names[i]:
+            k = 2
+            while True:
+                suffix = f'({k})'
+                cand = head(names[i])
+                while cand and not fits(cand + suffix):
+                    cand = cand[:-1]
+                cand = cand + suffix
+                if cand not in seen:
+                    out[i] = cand
+                    break
+                k += 1
+        seen.setdefault(out[i], i)
+    return out
 
 
 def calc_diff(current, previous) -> dict:
@@ -68,9 +172,7 @@ def calc_diff(current, previous) -> dict:
 def format_delta(diff_dict: dict) -> str:
     """"+1,234 (+12.3%) ▲" 形式の文字列を返す"""
     if diff_dict.get('comparable') is False:
-        if diff_dict.get('incomparable_reason') == 'method_mismatch':
-            return '比較不能（集計方法が異なる）'
-        return '比較不能（未出力）'
+        return incomparable_text(diff_dict.get('incomparable_reason'))
 
     diff = diff_dict['diff']
     pct = diff_dict['pct']
@@ -118,11 +220,16 @@ def compare_kpis(cur_kpis: dict, prev_kpis: dict) -> dict:
             cur_status = cur_kpis.get('key_events_status', 'missing')
             prev_status = prev_kpis.get('key_events_status', 'missing')
             comparable, reason = key_events_comparison(cur_status, prev_status)
+            mismatch = treatment_mismatch_events(cur_kpis, prev_kpis) if comparable else []
+            if mismatch:
+                # 当月・前月の値は出すが、差分と増減率は出さない（集計対象が月で違うため）
+                comparable, reason = False, 'treatment_mismatch'
             diff.update({
                 'comparable': comparable,
                 'incomparable_reason': reason,
                 'current_status': cur_status,
                 'previous_status': prev_status,
+                'treatment_mismatch': mismatch,
             })
             if not comparable:
                 diff['diff'] = 0.0
@@ -312,6 +419,8 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
     # 未出力を0件として比較すると、存在しない-100%減少を作ってしまう。
     cv_missing = kev.get('comparable') is False
     cv_method_mismatch = cv_missing and kev.get('incomparable_reason') == 'method_mismatch'
+    cv_no_breakdown = cv_missing and kev.get('incomparable_reason') == 'breakdown_unavailable'
+    cv_treatment = cv_missing and kev.get('incomparable_reason') == 'treatment_mismatch'
     cv_zero = (
         not cv_missing
         and int(kev.get('current', 0)) == 0
@@ -350,8 +459,12 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
         else:
             facts_down.append(f"平均エンゲージメント時間が前月比 {_pct(eng):.1f}% 短くなりました。")
 
-    if cv_method_mismatch:
+    if cv_treatment:
+        headline_lines.append('合計に含めるイベントが当月と前月で異なるため、キーイベントの前月比較はできません')
+    elif cv_method_mismatch:
         headline_lines.append('キーイベントの集計方法が当月と前月で異なるため、前月比較はできません')
+    elif cv_no_breakdown:
+        headline_lines.append('キーイベントのイベント別内訳が出力されていないため、前月比較はできません')
     elif cv_missing:
         headline_lines.append('キーイベントデータが未出力のため、前月比較はできません')
     elif cv_zero:
@@ -361,11 +474,22 @@ def compute_highlights(compared_kpis: dict, compared_channels: pd.DataFrame,
     # (priority, text) 。priority が大きいほど優先。
     scored_actions = []
 
-    if cv_method_mismatch:
+    if cv_treatment:
+        names = '」「'.join(str(m['name']) for m in kev.get('treatment_mismatch', [])[:3])
+        scored_actions.append((205,
+            f'「{names}」は一方の月だけ合計から外している（件数・総ユーザー数が同じ別イベントがある、'
+            'または完了画面への到達として別に数えた）。GA4のタグ設定で同じ操作を2つのイベントで'
+            '数えていないかを確認する。（根拠: 合計に含めるイベントが月で異なる）'))
+    elif cv_method_mismatch:
         scored_actions.append((210,
             'キーイベントの集計方法が当月と前月で異なる（一方はGA4のキーイベント明細、'
             '他方はイベント名からの判定）。両月を同じ形式のCSVで出力し直すと比較できる。'
             '（根拠: キーイベントの出力形式が月ごとに異なる）'))
+    elif cv_no_breakdown:
+        scored_actions.append((210,
+            'GA4の「エンゲージメントの概要」または「イベント」のCSVを同じ期間で追加する。'
+            'プラットフォーム別の合計しか無いと、予約・電話等と求人・その他のイベントを分けられず、'
+            '件数と前月比較を出せない。（根拠: キーイベントのイベント別内訳が未出力）'))
     elif cv_missing:
         scored_actions.append((210,
             'GA4のレポートにキーイベント明細を追加して再出力する。CSVに明細が無いため、0件なのか未出力なのかを判定できず、前月比較は行っていない。'
