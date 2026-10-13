@@ -8,3 +8,4 @@ pillow
 setuptools
 
 # restart marker v8 (2026-10-13): force full process restart on Streamlit Cloud
+# 2026-10-13 v9 反映のためのプロセス再起動用(内容に影響なし)
