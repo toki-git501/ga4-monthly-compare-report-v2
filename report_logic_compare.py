@@ -369,6 +369,12 @@ def side_event_items(cur_d: dict, prev_d: dict, cur_status: str, prev_status: st
     comparable, reason = key_events_comparison(cur_status, prev_status)
     if single_mode or comparable:
         return compare_key_events(cur_d or {}, prev_d or {})
+    if reason == 'method_mismatch':
+        # 前月も内訳は取得済み（集計方法が違うだけ）→ 値は出し、増減だけ比較不能
+        items = compare_key_events(cur_d or {}, prev_d or {})
+        for i in items:
+            i['incomparable'] = True
+        return items
     prev_text = {'missing': '未出力', 'breakdown_unavailable': '取得不能'}.get(reason, '—')
     items = [{'name': k, 'current': int(v), 'previous': None, 'prev_text': prev_text}
              for k, v in (cur_d or {}).items()]
@@ -651,6 +657,19 @@ class CompareReportCanvas:
                 align = 'right' if ci >= 1 and not is_header else 'left'
                 pad = 3 * mm if align == 'left' else -3 * mm
                 font_size = 8
+                if is_header and '\n' in str(cell):
+                    # 2行の見出し（期間ラベル＋集計方法など）。各行を列幅に収めて上下に描く
+                    parts = str(cell).split('\n')[:2]
+                    room = cw - 4 * mm
+                    fs = 6.5
+                    while fs > 5 and max(pdfmetrics.stringWidth(t, JP_FONT, fs) for t in parts) > room:
+                        fs -= 0.25
+                    tx = cx + (cw + pad if align == 'right' else pad)
+                    for li, t in enumerate(parts):
+                        self._text(tx, row_y - row_h * (0.42 if li == 0 else 0.82), t,
+                                   font_size=fs, color=txt_color, align=align)
+                    cx += cw
+                    continue
                 if is_header:
                     # 見出し（期間ラベル等）が列幅を超えて隣の列と重ならないよう縮める
                     room = cw - 4 * mm
@@ -1010,10 +1029,11 @@ class CompareReportCanvas:
         cur_status = cur_kpis.get('key_events_status', 'missing')
         prev_status = prev_kpis.get('key_events_status', 'missing')
         comparison_available, incomparable_reason = key_events_comparison(cur_status, prev_status)
+        method_mismatch = (not comparison_available and incomparable_reason == 'method_mismatch')
         excluded = compare_key_events(
             cur_kpis.get('key_events_dedup_excluded') or {},
             prev_kpis.get('key_events_dedup_excluded') or {},
-        ) if comparison_available else []
+        ) if (comparison_available or method_mismatch) else []
 
         has_kev_data = bool(compared_kevents) and any(
             (int(i.get('current', 0)) > 0 or int(i.get('previous', 0)) > 0)
@@ -1035,7 +1055,8 @@ class CompareReportCanvas:
             self._section_header(
                 margin, content_top,
                 'キーイベント発生回数 / 予約・電話アクションのセッション比（参考）',
-                '当月 vs 前月',
+                ('当月 vs 前月（集計方法が異なるため増減は比較していません）' if method_mismatch
+                 else '当月 vs 前月'),
             )
             left_w = 165 * mm
             right_w = PAGE_W - (margin * 2) - left_w - 6 * mm
@@ -1052,7 +1073,9 @@ class CompareReportCanvas:
         months = (f'当月: {status_label(cur_status)}' if single_mode else
                   f'当月: {status_label(cur_status)} / 前月: {status_label(prev_status)}')
         notice = None
-        if not comparison_available and incomparable_reason == 'method_mismatch':
+        if method_mismatch and compared_kevents:
+            notice = None   # 表とグラフに各月の値を出し、表の下に注記する
+        elif method_mismatch:
             notice = f'キーイベント比較不能（{months}）。集計方法が異なるため、増減を比較していません。'
         elif not comparison_available and incomparable_reason == 'breakdown_unavailable':
             notice = (f'キーイベント比較不能（{months}）。イベント別の内訳が無いため、'
@@ -1072,6 +1095,15 @@ class CompareReportCanvas:
         mismatch = ([] if (single_mode or not comparison_available)
                     else treatment_mismatch_events(cur_kpis, prev_kpis))
         table_notes = []
+        if method_mismatch and (compared_kevents or excluded):
+            def scope(status):
+                if status == KEY_EVENTS_INFERRED:
+                    return 'イベント名から判定（予約・電話等の語を含むイベント）'
+                return 'GA4のキーイベント明細（GA4でキーイベントに設定した全イベント）'
+            table_notes.append(
+                f'※ キーイベント比較不能（{months}）。当月は{scope(cur_status)}、前月は{scope(prev_status)}で'
+                '集計しており、対象範囲が異なります。各月の件数は表示していますが、集計方法が異なるため増減は比較していません。'
+            )
         if compared_kevents or excluded:
             table_notes.append(
                 '※ 参考比率 = キーイベント発生回数 ÷ セッション数。GA4のセッションCVRではなく、同一セッション内の複数回発生を含みます。'
@@ -1097,6 +1129,12 @@ class CompareReportCanvas:
                 return '-'
 
             headers = ['イベント名', cur_label, prev_label, '増減', '増減率', '当月参考比率', '前月参考比率']
+            if method_mismatch:
+                # 列見出しに各月の集計方法を添える（2行。詳しくは表の下の注記）
+                def method_tag(status):
+                    return '（名前から判定）' if status == KEY_EVENTS_INFERRED else '（GA4明細）'
+                headers[1] = f'{cur_label}\n{method_tag(cur_status)}'
+                headers[2] = f'{prev_label}\n{method_tag(prev_status)}'
             res_cur_total = sum(i['current'] for i in compared_kevents
                                 if is_reservation_or_phone(i['name']))
             res_prev_total = sum(i['previous'] for i in compared_kevents
@@ -1154,12 +1192,14 @@ class CompareReportCanvas:
             mismatch_names = {m['name'] for m in mismatch}
             for item, label in zip(shown, shown_labels):
                 rows.append(event_row(label, item['current'], item['previous'],
-                                      comparable=item['name'] not in mismatch_names))
+                                      comparable=(not method_mismatch
+                                                  and item['name'] not in mismatch_names)))
             if folded:
                 rows.append(event_row(
                     f'その他（{len(folded)}種）',
                     sum(i['current'] for i in folded),
                     sum(i['previous'] for i in folded),
+                    comparable=not method_mismatch,
                 ))
             # 同数のため合計から除外した行は件数を括弧で示し、合計・小計・参考比率に入れない
             for item, label in zip(excluded_shown, excluded_labels):
@@ -1179,13 +1219,14 @@ class CompareReportCanvas:
             # クリック・電話タップ等であり、実際の予約成立とは限らないため「アクション」と表記する。
             if has_res_row:
                 row = event_row('予約・電話アクション 小計', res_cur_total, res_prev_total,
-                                comparable=not mismatch)
+                                comparable=not (mismatch or method_mismatch))
                 rows.append(row)
             # 合計行（左表で合計に入れたイベントの和。別表・除外行は含めない）
             total_cur = sum(i['current'] for i in compared_kevents)
             total_prev = sum(i['previous'] for i in compared_kevents)
             rows.append(event_row('合計（求人関連を除く）' if has_recruit_table else '合計',
-                                  total_cur, total_prev, comparable=not mismatch))
+                                  total_cur, total_prev,
+                                  comparable=not (mismatch or method_mismatch)))
 
             self._comparison_table(margin, table_y - 5 * mm, headers, rows, col_ws)
             # 表は table_y - 5mm から描くため、下端はその分も差し引く
@@ -1268,9 +1309,14 @@ class CompareReportCanvas:
         incomparable = any(i.get('previous') is None for i in items)
         prev_text = next((i.get('prev_text') for i in items if i.get('previous') is None), '—')
 
+        method_diff = any(i.get('incomparable') for i in items)
+
         def row(name, cur_v, prev_v):
             if incomparable:
                 return [name, f'{int(cur_v):,}', prev_text, '比較不能']
+            if method_diff:
+                # 前月も取得済み（集計方法が違うだけ）→ 値は出し、増減だけ比較不能
+                return [name, f'{int(cur_v):,}', f'{int(prev_v):,}', '比較不能']
             d = int(cur_v) - int(prev_v)
             sign = '+' if d > 0 else ''
             return [name, f'{int(cur_v):,}', f'{int(prev_v):,}', f'{sign}{d:,}']
@@ -2427,12 +2473,16 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
             cur_data['df_ch_ses'].columns[1] if cur_data['df_ch_ses'] is not None else 'value',
         ) if cur_data['df_ch_ses'] is not None or prev_data['df_ch_ses'] is not None else pd.DataFrame()
 
-    key_events_comparable, _ = key_events_comparison(
+    key_events_comparable, kev_reason = key_events_comparison(
         cur_kpis.get('key_events_status'), prev_kpis.get('key_events_status'))
+    # 集計方法が違う月どうし（イベント名から判定 / GA4のキーイベント明細）でも、各月の件数は
+    # 事実として表とグラフに出す。増減・増減率だけを「比較不能」にする（P4）。
+    method_mismatch = kev_reason == 'method_mismatch'
+    show_breakdown = key_events_comparable or method_mismatch
     compared_kevents = compare_key_events(
         cur_kpis.get('key_events', {}),
         prev_kpis.get('key_events', {}),
-    ) if key_events_comparable else []
+    ) if show_breakdown else []
     # 完了到達・求人関連・未分類（別カテゴリ）。予約・電話等とは別表・別集計で示す。
     # 前月が比較できない場合も当月の明細は表示し、増減だけ「比較不能」にする。
     side_tables = build_side_tables(cur_kpis, prev_kpis, single_mode)
@@ -2448,9 +2498,10 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
     kev_chart = make_key_events_grouped_bar(
         cur_kpis.get('key_events', {}), prev_kpis.get('key_events', {}),
         cur_label, prev_label,
-        title=('キーイベント発生回数比較（求人関連を除く）' if compared_recruit
+        title=('キーイベント発生回数（当月と前月で集計方法が異なる）' if method_mismatch
+               else 'キーイベント発生回数比較（求人関連を除く）' if compared_recruit
                else 'キーイベント発生回数比較'),
-    ) if key_events_comparable else None
+    ) if show_breakdown else None
 
     pages_chart = make_top_pages_compare_chart(
         cur_data['df_pages'], prev_data['df_pages'])
@@ -2477,8 +2528,9 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
         int(prev_kpis.get('sessions', 0)),
         cur_label,
         prev_label,
-        show_diff=compared_kpis['key_events_total'].get('incomparable_reason') != 'treatment_mismatch',
-    ) if key_events_comparable else None
+        show_diff=compared_kpis['key_events_total'].get('incomparable_reason')
+        not in ('treatment_mismatch', 'method_mismatch'),
+    ) if show_breakdown else None
     paid_channel_chart = make_paid_channels_grouped_bar(
         cur_data.get('df_ch_ses'),
         prev_data.get('df_ch_ses'),
@@ -2487,7 +2539,8 @@ def generate_compare_report(cur_csv, prev_csv, output_path: str,
     )
 
     # 4. ハイライト計算
-    highlights = compute_highlights(compared_kpis, compared_channels, compared_kevents,
+    highlights = compute_highlights(compared_kpis, compared_channels,
+                                    compared_kevents if key_events_comparable else [],
                                     cur_pages=cur_data.get('df_pages'),
                                     prev_pages=prev_data.get('df_pages'))
 

@@ -845,3 +845,137 @@ class TestInputGaps:
         with pytest.raises(CsvMergeError) as exc:
             merge_ga4_csvs([blank.encode('utf-8'), Path(OLD_PREV).read_bytes()], names=['a.csv', 'b.csv'])
         assert 'a.csv（プロパティ名が空です）' in str(exc.value)
+
+
+# ─────────────────────────────────────────────
+# 同じ表で列数・行数が違う（実データ: スナップショットと概要の上位ページ）
+# ─────────────────────────────────────────────
+class TestPartialTables:
+    @staticmethod
+    def _df(rows, cols):
+        import pandas as pd
+        return pd.DataFrame(rows, columns=cols)
+
+    def test_列数が違っても共通列が一致すれば整合(self):
+        from csv_parser import tables_consistent
+        a = self._df([['p1', '10', '5', '0.2'], ['p2', '7', '3', '0.5']],
+                     ['ページ', '表示回数', 'アクティブ ユーザー', '直帰率'])
+        b = self._df([['p1', '10'], ['p2', '7']], ['ページ', '表示回数'])
+        assert tables_consistent(a, b) and tables_consistent(b, a)
+
+    def test_行数が違っても共通行が一致すれば整合(self):
+        from csv_parser import tables_consistent
+        a = self._df([['p1', '10'], ['p2', '7'], ['p3', '2']], ['ページ', '表示回数'])
+        b = self._df([['p1', '10'], ['p2', '7']], ['ページ', '表示回数'])
+        assert tables_consistent(a, b) and tables_consistent(b, a)
+
+    def test_共通行の値が1つでも違えば食い違い(self):
+        from csv_parser import tables_consistent
+        a = self._df([['p1', '10', '5'], ['p2', '7', '3']], ['ページ', '表示回数', 'アクティブ ユーザー'])
+        b = self._df([['p1', '10'], ['p2', '8'], ['p3', '1']], ['ページ', '表示回数'])
+        assert not tables_consistent(a, b)
+
+    def test_共通の行が無ければ食い違い(self):
+        from csv_parser import tables_consistent
+        a = self._df([['p1', '10']], ['ページ', '表示回数'])
+        b = self._df([['p9', '10']], ['ページ', '表示回数'])
+        assert not tables_consistent(a, b)
+        assert not tables_consistent(a, self._df([], ['ページ', '表示回数']))
+
+    def test_同じキーの行は合算せず含まれるかで見る(self):
+        from csv_parser import tables_consistent
+        a = self._df([['p1', '10'], ['p1', '4']], ['ページ', '表示回数'])
+        assert tables_consistent(a, self._df([['p1', '10']], ['ページ', '表示回数']))
+        assert not tables_consistent(a, self._df([['p1', '14']], ['ページ', '表示回数']))
+
+    def test_日別表は行がそろっていることも求める(self):
+        from csv_parser import tables_consistent
+        a = self._df([['0', '5'], ['1', '6']], ['N 日目', 'アクティブ ユーザー'])
+        b = self._df([['0', '5']], ['N 日目', 'アクティブ ユーザー'])
+        assert tables_consistent(a, b)
+        assert not tables_consistent(a, b, strict_rows=True)
+
+    def _truncated_eng(self, n_rows, change=None):
+        lines = _read(ENG).decode('utf-8').split('\n')
+        i = next(k for k, l in enumerate(lines) if l.startswith('ページ タイトルとスクリーン クラス,表示回数'))
+        j = i + 1
+        while j < len(lines) and lines[j].strip() and not lines[j].startswith('#'):
+            j += 1
+        body = lines[i + 1:i + 1 + n_rows]
+        if change is not None:
+            name, val = body[change].rstrip('\r').rsplit(',', 1)
+            body[change] = f'{name},{int(val) + 1}\r'
+        lines[i + 1:j] = body
+        return '\n'.join(lines).encode('utf-8')
+
+    def test_上位N件の打ち切りと列数の違いでは止めず情報量の多い表を使う(self):
+        eng = self._truncated_eng(10)
+        files = [_read(SNAP), _read(ACQ), eng, _read(EVT)]
+        assert validate_csv_inputs(files) == []
+        baseline = parse_ga4_csv(merge_ga4_csvs(files))
+        assert len(baseline['df_pages']) == 82                   # 行の多いスナップショット側
+        assert len(baseline['df_pages'].columns) == 5
+        for perm in itertools.permutations(files):
+            data = parse_ga4_csv(merge_ga4_csvs(list(perm)))
+            assert data['issues'] == []
+            assert data['df_pages'].equals(baseline['df_pages']), perm
+            assert data['kpis'] == baseline['kpis']
+
+    def test_共通行の表示回数が1つ違えばファイル名つきで止める(self):
+        eng = self._truncated_eng(10, change=3)
+        files = [_read(SNAP), _read(ACQ), eng, _read(EVT)]
+        for perm in itertools.permutations(range(4)):
+            names = ['s.csv', 'a.csv', 'e.csv', 'v.csv']
+            errors = validate_csv_inputs([files[i] for i in perm], cur_names=[names[i] for i in perm])
+            joined = '\n'.join(errors)
+            assert '「上位ページ」の表が複数のファイルにあり、値が一致しません' in joined, perm
+            assert 's.csv' in joined and 'e.csv' in joined
+
+    def test_日別表の行の欠けは他ファイルに全日あっても止める(self):
+        # スナップショット（旧形式）と集客サマリーの両方に日別アクティブユーザーがある場合
+        text = Path(OLD_CUR).read_text(encoding='utf-8')
+        lines = text.split('\n')
+        i = next(k for k, l in enumerate(lines) if l.startswith('N 日目,アクティブ ユーザー'))
+        short = lines[:i + 1] + lines[i + 2:]
+        other = '\n'.join(short).replace('# ----------------------------------------',
+                                          '# ---------------------------------------- ', 1)
+        errors = validate_csv_inputs([text.encode('utf-8'), other.encode('utf-8')])
+        assert any('「日別アクティブユーザー」の表が複数のファイルにあり' in e for e in errors)
+
+
+# ─────────────────────────────────────────────
+# 集計方法が違う月どうしでも各月の件数は出す（差分だけ比較不能）
+# ─────────────────────────────────────────────
+class TestMethodMismatchValues:
+    @pytest.fixture(scope='class')
+    def pages(self, tmp_path_factory):
+        pytest.importorskip('reportlab')
+        from report_logic_compare import generate_compare_report
+        prev_text = Path(OLD_PREV).read_text(encoding='utf-8').replace(
+            'イベント名,キーイベント\n\n',
+            'イベント名,キーイベント\nweb予約,40\n成人電話,12\n求人_送信ボタン_,9\nroute_click,5\n\n', 1)
+        out = tmp_path_factory.mktemp('mm') / 'method.pdf'
+        generate_compare_report(merge_ga4_csvs([SNAP, ACQ, ENG, EVT]), prev_text.encode('utf-8'),
+                                str(out), company_name='テスト医院L', detailed=True)
+        from test_multi_csv import _assert_no_footer_overlap
+        _assert_no_footer_overlap(out, 'テスト医院L')
+        return _pdf_pages(out)
+
+    def test_左表に両月の件数を出し増減は比較不能(self, pages):
+        p4 = pages[3]
+        assert 'WEB予約 136 40 比較不能 比較不能' in p4
+        assert '電話（成人） 64 12 比較不能 比較不能' in p4
+        # 前月は明細ありのため全キーイベントが対象（route_click も前月の合計に入る）
+        assert '合計（求人関連を除く） 368 57 比較不能 比較不能' in p4
+        flat = p4.replace('\n', '')
+        assert '集計方法が異なるため増減は比較していません' in flat
+        assert '（GA4明細）' in p4 and '（名前から判定）' in p4
+        assert '対象範囲が異なります' in flat
+
+    def test_求人別表は前月の値も出す(self, pages):
+        p4 = pages[3]
+        assert '求人_送信ボタン_ 61 9 比較不能' in p4
+        assert '求人関連 小計 70 9 比較不能' in p4
+
+    def test_P2のバナーは増減を出さない(self, pages):
+        assert '当月 368件（イベント名から判定） / 前月 57件（集計方法が異なるため比較不能）' in pages[1]

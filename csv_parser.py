@@ -194,23 +194,61 @@ def _cell_key(v):
     return s
 
 
-def tables_consistent(df_a: pd.DataFrame, df_b: pd.DataFrame) -> bool:
-    """同じ表が2つのファイルにある場合に、内容が一致するか。
+def _keyed_values(df: pd.DataFrame, cols: list) -> dict:
+    """{先頭列のキー: [指定列の値のタプル, ...]}（同じキーの行は合算せず、そのまま並べる）。"""
+    out = {}
+    key_col = df.columns[0]
+    for _, r in df.iterrows():
+        out.setdefault(str(r[key_col]).strip(), []).append(tuple(_cell_key(r[c]) for c in cols))
+    return {k: sorted(v, key=repr) for k, v in out.items()}
 
-    先頭列（キー）と、両方にある値の列を比べる（列の並び・行の順序は問わない）。
-    片方にしか無い列（例: スナップショットの上位ページにある直帰率）は比べない。
+
+def _is_sub_multiset(small: list, large: list) -> bool:
+    rest = list(large)
+    for x in small:
+        if x not in rest:
+            return False
+        rest.remove(x)
+    return True
+
+
+def tables_consistent(df_a: pd.DataFrame, df_b: pd.DataFrame, strict_rows: bool = False) -> bool:
+    """同じ表が2つのファイルにある場合に、内容が食い違っていないか。
+
+    同じ見出し名の列どうし・同じキー（先頭列）の行どうしだけを比べる（v9 実データ対応）。
+    GA4の画面によって同じ表でも列数（スナップショットの上位ページには直帰率等がある）や
+    行数（上位N件の打ち切り）が違うため、行・列の過不足は食い違いにしない。
+    - 共通のキーが1つも無い（片方が見出しだけの0件の表を含む）→ 食い違い
+    - 共通キー×共通列の値が1つでも違う → 食い違い
+    - 同じキーの行が複数ある場合は合算せず、少ない方の行が多い方に含まれるかを見る
+      （ユーザー数のように行間で足せない列があるため）
+    strict_rows=True（日別表）の場合は、キーの集合も完全に一致することを求める。
     """
     common = [c for c in df_a.columns[1:] if c in set(df_b.columns[1:])]
     if not common:
         return True
+    ka, kb = _keyed_values(df_a, common), _keyed_values(df_b, common)
+    if strict_rows and set(ka) != set(kb):
+        return False
+    shared = set(ka) & set(kb)
+    if not shared:
+        return not ka and not kb
+    for k in shared:
+        va, vb = ka[k], kb[k]
+        small, large = (va, vb) if len(va) <= len(vb) else (vb, va)
+        if not _is_sub_multiset(small, large):
+            return False
+    return True
 
-    def rows(df):
-        key_col = df.columns[0]
-        return sorted(
-            (str(r[key_col]).strip(),) + tuple(_cell_key(r[c]) for c in common)
-            for _, r in df.iterrows()
-        )
-    return rows(df_a) == rows(df_b)
+
+def table_information_key(df: pd.DataFrame) -> tuple:
+    """複数ファイルに同じ表があるとき、どれを採用するかの順位（大きいほど優先）。
+
+    行が多い方（上位N件の打ち切りが少ない方）→ 列が多い方。それでも同じなら内容で決める
+    （入力の順序で採用する表が変わらないようにするため）。
+    """
+    content = tuple(tuple(str(x) for x in row) for row in df.itertuples(index=False))
+    return (len(df), len(df.columns), tuple(str(c) for c in df.columns), content)
 
 
 def weighted_engagement(df_engage: pd.DataFrame, df_active: pd.DataFrame) -> tuple:
@@ -394,30 +432,37 @@ def parse_ga4_csv(filepath_or_bytes) -> dict:
                 found.append({'df': None, 'src': src, 'error': True})
         return found
 
-    def pick_consistent(found: list, label: str):
-        """同じ表が複数あれば一致を確かめ、先頭を返す（空の表＝出力済み0件も比べる）。
+    def pick_consistent(found: list, label: str, strict_rows: bool = False):
+        """同じ表が複数あれば食い違いが無いかを確かめ、情報量の多い表を返す。
 
-        先頭が空の表なら None（見出しだけの表は従来どおり「無い」扱い。キーイベントは
+        空の表（出力済み0件）も比べる。すべて空の表なら None（見出しだけの表は従来どおり「無い」扱い。キーイベントは
         has_kev_header で「設定済み0件」と判定する）。
         """
         tables = [f for f in found if f['df'] is not None]
         if not tables:
             return None
-        first = tables[0]
-        for other in tables[1:]:
-            if not tables_consistent(first['df'], other['df']):
-                empty_note = ''
-                if first.get('empty') or other.get('empty'):
-                    empty_note = '一方は見出しだけ（0件）で、もう一方には行があります。'
-                issues.append(
-                    f'「{label}」の表が複数のファイルにあり、値が一致しません'
-                    f'（{first["src"]} と {other["src"]}）。{empty_note}同じ期間・同じ条件で出力したファイルか'
-                    '確認してください。どちらかを選んだり合算したりすると数値が変わるため、PDFは生成できません。'
-                )
-                break
-        if first.get('empty'):
+        # 全ての組で食い違いが無いかを確かめる（行・列の過不足は食い違いにしない）
+        for i, a in enumerate(tables):
+            for b in tables[i + 1:]:
+                if not tables_consistent(a['df'], b['df'], strict_rows=strict_rows):
+                    empty_note = ''
+                    if a.get('empty') or b.get('empty'):
+                        empty_note = '一方は見出しだけ（0件）で、もう一方には行があります。'
+                    elif strict_rows:
+                        empty_note = '日付（N 日目）の行がそろっていないか、同じ日の値が違います。'
+                    else:
+                        empty_note = '同じ行・同じ列の値が違います。'
+                    issues.append(
+                        f'「{label}」の表が複数のファイルにあり、値が一致しません'
+                        f'（{a["src"]} と {b["src"]}）。{empty_note}同じ期間・同じ条件で出力したファイルか'
+                        '確認してください。どちらかを選んだり合算したりすると数値が変わるため、PDFは生成できません。'
+                    )
+                    return None if a.get('empty') else a
+        if all(t.get('empty') for t in tables):
             return None
-        return first
+        # 採用するのは情報量の多い表（行が多い→列が多い）。入力順には依存しない
+        return max((t for t in tables if not t.get('empty')),
+                   key=lambda t: table_information_key(t['df']))
 
     expected_days = expected_day_keys(meta['start'], meta['end'])
 
@@ -429,7 +474,7 @@ def parse_ga4_csv(filepath_or_bytes) -> dict:
         for f in found:
             if f['error']:
                 issues.append(f'「{label}」（{f["src"]}）の表を読み込めません。')
-        first = pick_consistent(found, label)
+        first = pick_consistent(found, label, strict_rows=day_key)
         if first is None:
             return None
         df = first['df']
